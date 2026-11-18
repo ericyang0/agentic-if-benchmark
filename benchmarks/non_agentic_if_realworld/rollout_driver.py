@@ -202,7 +202,7 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         manifest = json.loads((dataset / "release_manifest.json").read_bytes())
         binding = {
             "release": pin["artifacts"]["release_manifest.json"],
-            "model": served[0],
+            "model": {key: served[0].get(key) for key in ("id", "root", "owned_by", "max_model_len")},
             "requested_ids": sorted(requested_ids),
             "profile": manifest["profile"],
             "runtime": {
