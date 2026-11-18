@@ -9807,6 +9807,48 @@ def _custom_tool_config(**overrides: Any) -> VLLMModelConfig:
     )
 
 
+@mark.asyncio
+async def test_upstream_chat_stream_preserves_the_chat_request(tmp_path: Path) -> None:
+    directory = tmp_path / "captures"
+    model = VLLMModel(
+        config=_custom_tool_config(upstream_chat_stream=True, upstream_chat_capture_dir=directory),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    client = MagicMock(spec=NeMoGymAsyncOpenAI)
+    chunk = {
+        "object": "chat.completion.chunk",
+        "id": "chatcmpl-synthetic",
+        "model": "dummy_model",
+        "created": FIXED_TIME,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Ready."}, "finish_reason": "stop"}],
+    }
+    raw = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+    client.read_chat_completion_stream = AsyncMock(return_value=raw)
+    payload = {
+        "messages": [
+            {"role": "assistant", "content": "First answer"},
+            {"role": "assistant", "content": "Another answer"},
+            {"role": "user", "name": "reader", "content": "Continue."},
+        ],
+        "model": "dummy_model",
+        "chat_template_kwargs": {"enable_thinking": True},
+        "seed": 17,
+    }
+
+    result = await model._engine_chat_completion(client, {}, payload, summary=False)
+
+    client.read_chat_completion_stream.assert_awaited_once_with(headers=None, **payload)
+    client.create_chat_completion.assert_not_called()
+    assert result["choices"][0]["message"]["content"] == "Ready."
+    stream_sha256 = result["metrics"]["upstream_chat_stream_sha256"]
+    assert (directory / f"{stream_sha256}.sse").read_bytes() == raw
+    stored = directory / f"{result['metrics']['upstream_chat_capture_sha256']}.json"
+    assert json.loads(stored.read_text()) == {
+        "request": {**payload, "stream": True, "stream_options": {"include_usage": True}},
+        "response_sha256": stream_sha256,
+    }
+
+
 def test_get_converter_forwards_the_custom_tool_strategy() -> None:
     model = VLLMModel(
         config=_custom_tool_config(custom_tool_strategy="function_bridge"),

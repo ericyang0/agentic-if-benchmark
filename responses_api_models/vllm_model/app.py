@@ -21,6 +21,8 @@ import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import Lock
 from time import monotonic, time, time_ns
 from typing import Any, Awaitable, Callable, ClassVar, Dict, List, Literal, Optional, Union, get_args
@@ -70,6 +72,7 @@ from nemo_gym.models import (
     note_generation_backend,
     note_generation_request,
     pop_dynamo_call_result,
+    reconstruct_upstream_chat_completion,
     split_dynamo_capture_refusal,
     split_responses_input_output_items,  # noqa: F401
     start_model_execution,
@@ -834,6 +837,9 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     # Total time limit for each HTTP attempt to the engine, not for the whole call; None means no limit.
     # A timed-out attempt is retried like any other transport error, so the call's attempt count is unchanged.
     request_timeout_seconds: Optional[PositiveFloat] = None
+    # Preserve upstream delivery evidence for benchmarks that require a real stream.
+    upstream_chat_stream: bool = False
+    upstream_chat_capture_dir: Path | None = None
     # Wall-clock cap on connection-error retries per model call, on every client including
     # rebuilt endpoint clients. None waits without limit so a training run can ride out an engine restart.
     endpoint_connection_retry_timeout_s: Optional[float] = Field(default=None, gt=0)
@@ -878,6 +884,7 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
                 "inline_tool_output_images",
                 "preserve_thinking_blocks",
                 "stream_keepalive_s",
+                "upstream_chat_stream",
             ):
                 if getattr(self, option):
                     raise ValueError(
@@ -898,6 +905,10 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
                 "preserve_thinking_blocks requires use_completions_api=false: /v1/completions has no assistant "
                 "messages to carry the thinking blocks on"
             )
+        if self.upstream_chat_stream and (self.use_completions_api or self.dynamo_frontend):
+            raise ValueError("upstream_chat_stream requires a vLLM Chat Completions backend")
+        if self.upstream_chat_capture_dir is not None and not self.upstream_chat_stream:
+            raise ValueError("upstream_chat_capture_dir requires upstream_chat_stream")
         return self
 
     @model_validator(mode="after")
@@ -2984,7 +2995,46 @@ class VLLMModel(SimpleResponsesAPIModel):
         """One chat call to the engine; a compaction summary call goes through the summary recovery."""
         if summary:
             return await self._create_compaction_summary(client, {**transport_options, **body})
+        if self.config.upstream_chat_stream:
+            raw = await self._call_endpoint(
+                client, client.read_chat_completion_stream(headers=transport_options.get("_headers"), **body)
+            )
+            result = reconstruct_upstream_chat_completion(raw)
+            stream_sha256 = hashlib.sha256(raw).hexdigest()
+            result["metrics"] = {"upstream_chat_stream_sha256": stream_sha256}
+            if (capture_dir := self.config.upstream_chat_capture_dir) is not None:
+                capture = await asyncio.to_thread(self._capture_upstream_chat, capture_dir, body, raw, stream_sha256)
+                result["metrics"]["upstream_chat_capture_sha256"] = capture
+            return result
         return await self._call_endpoint(client, client.create_chat_completion(**transport_options, **body))
+
+    @staticmethod
+    def _capture_upstream_chat(directory: Path, body: dict, raw: bytes, stream_sha256: str) -> str:
+        directory = directory.expanduser().resolve()
+        if any(
+            (parent / ".git").is_file() or (parent / ".git/HEAD").is_file()
+            for parent in (directory, *directory.parents)
+        ):
+            raise ValueError("Keep upstream Chat captures outside Git")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if directory.stat().st_uid != os.getuid() or directory.stat().st_mode & 0o077:
+            raise ValueError("The upstream Chat capture directory must be owner-only")
+        request = {**body, "stream": True, "stream_options": {"include_usage": True}}
+        capture = {"request": request, "response_sha256": stream_sha256}
+        encoded = json.dumps(
+            capture, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        capture_sha256 = hashlib.sha256(encoded).hexdigest()
+        for filename, data in ((f"{stream_sha256}.sse", raw), (f"{capture_sha256}.json", encoded)):
+            with NamedTemporaryFile(dir=directory, delete=False) as stream:
+                staging = Path(stream.name)
+                try:
+                    stream.write(data)
+                    stream.flush()
+                    staging.replace(directory / filename)
+                finally:
+                    staging.unlink(missing_ok=True)
+        return capture_sha256
 
     async def _create_compaction_summary(self, client: NeMoGymAsyncOpenAI, body: Dict[str, Any]) -> Dict[str, Any]:
         """Serve a compaction summary the session can use, or refuse with 422 after the configured attempts.
@@ -3071,7 +3121,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                 },
             )
 
-    async def _call_endpoint(self, client: NeMoGymAsyncOpenAI, call: Awaitable[Dict[str, Any]]) -> Dict[str, Any]:
+    async def _call_endpoint[T](self, client: NeMoGymAsyncOpenAI, call: Awaitable[T]) -> T:
         """Await one engine call and record how the endpoint answered.
 
         A 5xx or a connection error counts against the endpoint. Any other answer, a 4xx

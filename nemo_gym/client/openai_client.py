@@ -905,6 +905,22 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         await alog_api_cost("/chat/completions", kwargs, getattr(response, "headers", None), body)
         return body
 
+    async def read_chat_completion_stream(self, *, headers: dict[str, str] | None = None, **kwargs: Any) -> bytes:
+        """Read one upstream Chat Completions event stream without redispatching a disconnected request."""
+        options = {
+            "url": f"{self.base_url}/chat/completions",
+            "json": {**kwargs, "stream": True, "stream_options": {"include_usage": True}},
+            "_resend_after_disconnect": False,
+        }
+        if headers:
+            options["headers"] = headers
+        response = await self._request(method="POST", **options)
+        async with response:
+            await self._raise_for_status(response, options)
+            if response.content_type != "text/event-stream":
+                raise ValueError("The upstream Chat Completions response is not an event stream")
+            return await response.read()
+
     async def create_completion(self, **kwargs):
         request_kwargs = dict(
             url=f"{self.base_url}/completions",

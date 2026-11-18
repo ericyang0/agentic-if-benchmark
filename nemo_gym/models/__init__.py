@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         CaptureStore,
         ModelCallCaptureConfig,
         install_model_call_capture,
+        reconstruct_upstream_chat_completion,
         start_model_execution,
     )
     from nemo_gym.models.responses_streaming import (
@@ -96,6 +97,7 @@ _PUBLIC_API = {
     "flatten_namespace_tools": "responses_streaming",
     "generation_cut_requester": "_checkpoint",
     "install_model_call_capture": "model_call_capture",
+    "reconstruct_upstream_chat_completion": "model_call_capture",
     "is_propagated_refusal": "base_responses_api_model",
     "is_responses_lifecycle_chunk": "responses_streaming",
     "make_external_capture_handler": "token_capture.external_capture",

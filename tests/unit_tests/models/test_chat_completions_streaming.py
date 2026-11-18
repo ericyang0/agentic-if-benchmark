@@ -51,7 +51,45 @@ from nemo_gym.models.model_call_capture import (
     _parse_sse_events,
     _reconstruct_chat_sse,
     install_model_call_capture,
+    reconstruct_upstream_chat_completion,
 )
+
+
+def test_reconstruct_upstream_requires_terminal_marker_and_keeps_token_evidence() -> None:
+    identity = {"object": "chat.completion.chunk", "id": "chatcmpl-test", "model": "test", "created": 2026}
+    events = [
+        {
+            "prompt_token_ids": [1, 2],
+            "choices": [
+                {"index": 0, "delta": {"role": "assistant", "reasoning_content": "Reasoning."}, "token_ids": [3]}
+            ],
+        },
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "Answer."},
+                    "token_ids": [4],
+                    "logprobs": {"content": [{"token": "token_id:4", "logprob": -0.5}]},
+                }
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2}},
+    ]
+    body = "".join("data: " + json.dumps(identity | event) + "\n\n" for event in events).encode()
+    with pytest.raises(ValueError, match="terminal marker"):
+        reconstruct_upstream_chat_completion(body)
+    result = reconstruct_upstream_chat_completion(body + b"data: [DONE]\n\n")
+    assert result["prompt_token_ids"] == [1, 2]
+    assert result["choices"][0]["token_ids"] == [3, 4]
+    assert result["choices"][0]["logprobs"]["content"] == [{"token": "token_id:4", "logprob": -0.5}]
+    assert result["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "Answer.",
+        "reasoning_content": "Reasoning.",
+    }
+    assert result["choices"][0]["finish_reason"] == "stop"
 
 
 def _completion(

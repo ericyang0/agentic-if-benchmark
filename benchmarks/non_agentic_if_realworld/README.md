@@ -1,0 +1,42 @@
+# Real-world Non-Agentic Instruction Following
+
+The private release contains 571 historical regression cases and 686 atomic
+criteria. Every case is evaluation-only and development-exposed. One case was
+excluded before launch because its criterion could not be resolved reliably.
+Historical grades retain their original judge model and protocol.
+
+## Prepare and run
+
+Obtain read access to the approved private registry through your organization's
+access process. Install Gym with the `mlflow` extra and set the approved
+`mlflow_tracking_uri` and `mlflow_tracking_token` in your private configuration.
+Preparation verifies the release and every artifact before producing dataset
+rows. Supply owner-only cache and capture directories outside Git using
+`NON_AGENTIC_IF_DATA_DIR` and `NON_AGENTIC_IF_CAPTURE_DIR`.
+
+```bash
+gym eval prepare --benchmark non_agentic_if_realworld
+gym eval run --benchmark non_agentic_if_realworld \
+  --limit 5 --output /path/to/owner-only-run/rollouts.jsonl
+```
+
+Use the standard vLLM model server with an endpoint that supplies its context
+length, tokenizer count, token IDs and log probabilities. The rollout driver
+sends the original Chat Completions history to preserve named participants and
+adjacent assistant turns. It uses seed 17, temperature 0.7 and context-bounded
+caps of 32,768, 65,536 and 131,072 tokens. The verified upstream stream, full
+Responses output, and visible judge projection are stored separately. Tool
+calls stay inert. This benchmark fixes the request controls, so run without
+additional overrides or repeats.
+
+Install and authenticate Codex on the driver for direct GPT-6.2 Sol judging
+with medium reasoning. The judge receives the frozen criteria and applicable
+delivery-specific rubric. Every criterion must pass for a scored pass. A valid
+violation fails the item. Unresolved assessments and technical problems are
+reported as unscored. The complete accuracy metric requires valid grades for
+all 571 cases. Scores from bounded smoke runs carry the selected and scored
+denominators.
+
+Keep rollout artifacts and judge receipts private. A new provider, judge model,
+or scoring protocol needs a separate run. Treat an interrupted policy or judge
+dispatch as ambiguous and retain the attempt directory when resuming.

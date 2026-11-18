@@ -1,0 +1,20 @@
+{
+  "artifacts": {
+    "criteria.jsonl": "311599b8edfdf71d49627a5bd2098051815a4eb92cdec368d86a80a6bd3b8708",
+    "judge.schema.json": "9bd99bb75406e0e92729f11b4453cd19b6acfb896a1507c65cfa0ae05b0a7e15",
+    "membership.jsonl": "1b6fd76991b9452c6b8ea286a24695fc18c24fc00e940cc2ad30623a77d4bf4f",
+    "native.schema.json": "9defea4de36a17156240cd91878da5bddb0f71fc9167e7ad8c1c55a6b901b15b",
+    "non_agentic_if_replay_judge_v2_3.md": "4a723a7ed9375320b10d2fb9e97763216c1dcf69c55410f56086265c9a471e48",
+    "non_agentic_if_replay_judge_v2_4.md": "f3419cabe617af5368eb1f0958a27933c51a7bb491433716fd7828b56aff8d55",
+    "non_agentic_if_replay_judge_v2_5_empty_bounded.md": "339ea4fc482c4f20115aebd6128b5600b1a9279a51d9f042d5551c4ebef488d8",
+    "non_agentic_if_replay_judge_v2_6_empty_stop.md": "d6824b2717d202acc8583d447273513f08f1847d9419e5be3fb68b281cfaa3a2",
+    "release_manifest.json": "9b90652954004f50f8d19504b4f5d8a47bf266f66cd3a9b5dbf6a1a81a1092ca",
+    "requests.jsonl": "6e132450b8452c02bccbdeb2d950b5f400c4954d52938c98bb02121f4cd74dd2",
+    "rubric.md": "f5602faa12ead98cdb706c8190f3cd3449686c8e39c057cdb430485e24c7e076"
+  },
+  "cases": 571,
+  "criteria": 686,
+  "dataset_name": "non_agentic_if_realworld",
+  "tracking_uri_sha256": "f1804527ed57a15111283417136fd453c6910e4e327daab8740e34c2a953f0ee",
+  "version": "1.0.0"
+}

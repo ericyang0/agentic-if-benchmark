@@ -576,6 +576,64 @@ def _reconstruct_chat_sse(events: list[dict[str, Any]]) -> Optional[dict[str, An
     return result
 
 
+def reconstruct_upstream_chat_completion(raw: bytes) -> dict[str, Any]:
+    """Require a complete upstream stream and preserve vLLM token IDs and log probabilities."""
+    data = [
+        "\n".join(line[5:].lstrip() for line in block.splitlines() if line.startswith("data:"))
+        for block in re.split(r"\r?\n\r?\n", raw.decode("utf-8"))
+    ]
+    payloads = [payload for payload in data if payload]
+    if not payloads or payloads[-1] != "[DONE]" or "[DONE]" in payloads[:-1]:
+        raise ValueError("Missing or misplaced upstream Chat Completions terminal marker")
+    events = [json.loads(payload) for payload in payloads[:-1]]
+    if not events or any(
+        not isinstance(event, dict)
+        or event.get("object") != "chat.completion.chunk"
+        or not isinstance(event.get("choices"), list)
+        or len(event["choices"]) > 1
+        or "error" in event
+        for event in events
+    ):
+        raise ValueError("Invalid upstream Chat Completions chunk")
+    first = events[0]
+    if any(not isinstance(first.get(key), str) or not first[key] for key in ("id", "model")):
+        raise ValueError("Missing upstream Chat Completions identity")
+    if type(first.get("created")) is not int or any(
+        any(event.get(key) != first[key] for key in ("id", "model", "created")) for event in events
+    ):
+        raise ValueError("Upstream Chat Completions identity changed")
+    choices = [choice for event in events for choice in event["choices"]]
+    if not choices or any(
+        not isinstance(choice, dict) or choice.get("index") != 0 or not isinstance(choice.get("delta"), dict)
+        for choice in choices
+    ):
+        raise ValueError("Expected one upstream Chat Completions choice")
+    if not choices[-1].get("finish_reason") or any(choice.get("finish_reason") for choice in choices[:-1]):
+        raise ValueError("Missing or misplaced upstream Chat Completions finish reason")
+    roles = [choice["delta"]["role"] for choice in choices if choice["delta"].get("role") is not None]
+    if not roles or any(role != "assistant" for role in roles):
+        raise ValueError("Expected an upstream assistant role")
+    result = _reconstruct_chat_sse(events)
+    assert result is not None
+    result["created"] = first["created"]
+    for key in ("service_tier", "system_fingerprint", "prompt_token_ids"):
+        values = [event[key] for event in events if event.get(key) is not None]
+        if values:
+            if any(value != values[0] for value in values):
+                raise ValueError(f"Conflicting upstream {key}")
+            result[key] = values[0]
+    reconstructed = result["choices"][0]
+    choice_token_ids = [choice["token_ids"] for choice in choices if choice.get("token_ids") is not None]
+    if choice_token_ids:
+        reconstructed["token_ids"] = [token_id for chunk_ids in choice_token_ids for token_id in chunk_ids]
+    if any(choice.get("logprobs") is not None for choice in choices):
+        reconstructed["logprobs"] = {
+            field: [entry for choice in choices for entry in ((choice.get("logprobs") or {}).get(field) or [])]
+            for field in ("content", "refusal")
+        }
+    return result
+
+
 def _stream_report(failure_log: Optional[RequestFailureLog], error: BaseException | None) -> Optional[dict]:
     """The bounded ``FailureHeader.STREAM_FIELD`` value for a stream's request log; ``None`` with nothing to report."""
     return FailureHeader.stream_value(failure_log.reply_report(error)) if failure_log is not None else None

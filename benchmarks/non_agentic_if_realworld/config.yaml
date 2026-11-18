@@ -1,0 +1,38 @@
+split: benchmark
+rollout_collection_driver: benchmarks.non_agentic_if_realworld.rollout_driver:run_rollout_collection
+non_agentic_if_realworld_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      model_server: {type: responses_api_models, name: policy_model}
+      execute_tools: false
+      skip_verification: true
+      datasets:
+        - name: non_agentic_if_realworld
+          type: benchmark
+          jsonl_fpath: benchmarks/non_agentic_if_realworld/data/prepared.jsonl
+          prepare_script: benchmarks/non_agentic_if_realworld/prepare.py
+          num_repeats: 1
+non_agentic_if_realworld_environment:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server: {type: responses_api_agents, name: non_agentic_if_realworld_agent}
+policy_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      uses_reasoning_parser: true
+      uses_interleaved_reasoning: true
+      upstream_chat_stream: true
+      upstream_chat_capture_dir: ${oc.env:NON_AGENTIC_IF_CAPTURE_DIR,${oc.env:HOME}/.cache/nemo-gym/non_agentic_if_realworld/captures}
+      return_token_id_information: true
+      request_prompt_and_generation_token_ids: true
+      forward_request_chat_template_kwargs: true
+      refit_output_budget_to_window: false
+      refit_output_budget_to_prompt: false
+      max_num_tries: 1
+      max_http_attempts: 1
