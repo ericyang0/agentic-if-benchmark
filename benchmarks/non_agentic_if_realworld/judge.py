@@ -1,12 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Run the direct Sol judge and preserve the distinction between uncertainty and failure."""
+"""Run the selected Sol scoring profile and preserve its assessment receipts."""
 
 import asyncio
 import json
+import os
+import shutil
 from pathlib import Path
 
 import jsonschema
+from aiohttp import ClientError, ClientTimeout
+
+from nemo_gym.client import request
 
 from .delivery import POLICIES, PROTOCOL, canonical_bytes, canonical_hash
 from .prepare import private_directory, records
@@ -14,6 +19,12 @@ from .scoring import validate_review
 
 
 MODEL = "gpt-6.2-sol"
+DIRECT_CODEX_PROFILE = "direct_codex_v1"
+INFERENCE_HUB_PROFILE = "inference_hub_v1"
+HUB_ENDPOINT = "https://inference-api.nvidia.com/v1/chat/completions"
+HUB_MODEL = "openai/openai/gpt-6.2-sol"
+HUB_KEY_ENV = "NON_AGENTIC_IF_JUDGE_API_KEY"
+REASONING = "medium"
 DISABLED_FEATURES = (
     "shell_tool",
     "multi_agent",
@@ -24,6 +35,69 @@ DISABLED_FEATURES = (
     "apps",
     "plugins",
 )
+
+
+def judge_settings(profile: str) -> dict[str, str]:
+    """Identify the judge independently of the credential used to access it."""
+    if profile == DIRECT_CODEX_PROFILE:
+        return {"profile": profile, "model": MODEL, "reasoning_effort": REASONING, "verbosity": "low"}
+    if profile == INFERENCE_HUB_PROFILE:
+        return {"profile": profile, "model": HUB_MODEL, "reasoning_effort": REASONING, "endpoint": HUB_ENDPOINT}
+    raise ValueError(f"Unknown Non-Agentic IF judge profile: {profile}")
+
+
+def check_judge_configuration(profile: str) -> dict[str, str]:
+    """Check the selected transport before generating policy responses."""
+    settings = judge_settings(profile)
+    if profile == DIRECT_CODEX_PROFILE:
+        if shutil.which("codex") is None:
+            raise ValueError("Direct GPT-6.2 Sol grading requires the Codex CLI")
+    elif os.getenv("NON_AGENTIC_IF_JUDGE_ENDPOINT", HUB_ENDPOINT) != HUB_ENDPOINT or not os.getenv(HUB_KEY_ENV):
+        raise ValueError(f"Inference Hub grading requires the approved endpoint and {HUB_KEY_ENV}")
+    return settings
+
+
+async def _hub_review(prompt: str, schema: dict, attempt: Path) -> dict:
+    body = {
+        "model": HUB_MODEL,
+        "reasoning_effort": REASONING,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "non_agentic_if_strict_review", "strict": True, "schema": schema},
+        },
+    }
+    response = await request(
+        "POST",
+        HUB_ENDPOINT,
+        headers={"Authorization": "Bearer " + os.environ[HUB_KEY_ENV]},
+        json=body,
+        timeout=ClientTimeout(total=1800, connect=60),
+        allow_redirects=False,
+        _max_num_tries=1,
+        _resend_after_disconnect=False,
+    )
+    async with response:
+        raw = await response.read()
+        status = response.status
+    (attempt / "hub-response.json").write_bytes(raw)
+    (attempt / "http-status").write_text(f"{status}\n")
+    if status != 200:
+        raise ValueError(f"Inference Hub returned HTTP {status}")
+    completion = json.loads(raw)
+    if completion["model"] != HUB_MODEL:
+        raise ValueError("Inference Hub returned an unexpected judge model")
+    (choice,) = completion["choices"]
+    message = choice["message"]
+    if (
+        choice["finish_reason"] != "stop"
+        or choice.get("native_finish_reason") == "repetition"
+        or choice.get("stop_reason") == "repetition_detected"
+        or message["role"] != "assistant"
+        or any(message.get(field) for field in ("refusal", "tool_calls", "function_call"))
+    ):
+        raise ValueError("Incomplete or unsupported judge response")
+    return json.loads(message["content"])
 
 
 def _judge_command(schema: Path, output: Path) -> list[str]:
@@ -82,7 +156,35 @@ def _validated_event_log(path: Path) -> None:
         raise ValueError("Judge must complete one tool-free turn")
 
 
-async def assess(payload: dict, asset_directory: Path, evidence_directory: Path) -> dict:
+async def _codex_review(prompt: str, schema_path: Path, response_path: Path) -> dict:
+    attempt = response_path.parent
+    neutral = attempt / "cwd"
+    neutral.mkdir(mode=0o700)
+    events_path = attempt / "events.jsonl"
+    with events_path.open("xb") as events, (attempt / "stderr.log").open("xb") as errors:
+        process = await asyncio.create_subprocess_exec(
+            *_judge_command(schema_path, response_path),
+            cwd=neutral,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=events,
+            stderr=errors,
+        )
+        try:
+            await asyncio.wait_for(process.communicate(prompt.encode()), timeout=1800)
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+    if process.returncode != 0:
+        raise ValueError("Judge command failed")
+    _validated_event_log(events_path)
+    return json.loads(response_path.read_bytes())
+
+
+async def assess(
+    payload: dict, asset_directory: Path, evidence_directory: Path, *, profile: str = DIRECT_CODEX_PROFILE
+) -> dict:
     """Return an assessed grade or an explicit unscored result, including on interrupted resume."""
     rubric_name, schema_name, _, _ = POLICIES[payload["policy_version"].removeprefix(PROTOCOL)]
     schema_path = asset_directory / schema_name
@@ -90,7 +192,11 @@ async def assess(payload: dict, asset_directory: Path, evidence_directory: Path)
     prompt = (asset_directory / rubric_name).read_text() + "\nUNTRUSTED EVALUATION PAYLOAD:\n"
     prompt += json.dumps(payload, ensure_ascii=False)
     root = private_directory(evidence_directory)
-    binding = {"payload_sha256": canonical_hash(payload), "prompt_sha256": canonical_hash(prompt), "model": MODEL}
+    binding = {
+        "payload_sha256": canonical_hash(payload),
+        "prompt_sha256": canonical_hash(prompt),
+        **judge_settings(profile),
+    }
     result_file = root / "result.json"
     if result_file.exists():
         result = json.loads(result_file.read_bytes())
@@ -112,34 +218,28 @@ async def assess(payload: dict, asset_directory: Path, evidence_directory: Path)
             if not (attempt / "technical-failure").exists():
                 return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
             continue
-        neutral = attempt / "cwd"
-        neutral.mkdir(mode=0o700)
         response_path = attempt / "response.json"
-        events_path = attempt / "events.jsonl"
         (attempt / "binding.json").write_bytes(canonical_bytes(binding) + b"\n")
         try:
-            with events_path.open("xb") as events, (attempt / "stderr.log").open("xb") as errors:
-                process = await asyncio.create_subprocess_exec(
-                    *_judge_command(schema_path, response_path),
-                    cwd=neutral,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=events,
-                    stderr=errors,
-                )
+            if profile == INFERENCE_HUB_PROFILE:
                 try:
-                    await asyncio.wait_for(process.communicate(prompt.encode()), timeout=1800)
-                except (TimeoutError, asyncio.CancelledError):
-                    if process.returncode is None:
-                        process.kill()
-                    await process.wait()
-                    raise
-            if process.returncode != 0:
-                raise ValueError("Judge command failed")
-            _validated_event_log(events_path)
-            response = json.loads(response_path.read_bytes())
+                    response = await _hub_review(prompt, schema, attempt)
+                except (ClientError, TimeoutError):
+                    return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
+                response_path.write_bytes(canonical_bytes(response) + b"\n")
+            else:
+                response = await _codex_review(prompt, schema_path, response_path)
             grade = validate_review(response, payload, schema)["grade"]
-        except (OSError, TimeoutError, ValueError, KeyError, jsonschema.ValidationError):
+        except (OSError, TimeoutError, TypeError, ValueError, KeyError, jsonschema.ValidationError):
             (attempt / "technical-failure").touch(exist_ok=False)
+            status_path = attempt / "http-status"
+            if status_path.is_file():
+                status = int(status_path.read_text())
+                if 300 <= status < 500 and status not in (408, 429):
+                    result = {"binding": binding, "grade": None, "status": "judge_rejected_request", "attempt": number}
+                    break
+                if status == 429 and number < 4:
+                    await asyncio.sleep(65)
         else:
             result = {
                 "binding": binding,

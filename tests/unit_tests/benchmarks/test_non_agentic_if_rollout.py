@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import ClientConnectionError
 
+from benchmarks.non_agentic_if_realworld import judge as judge_runtime
 from benchmarks.non_agentic_if_realworld import rollout_driver
 from benchmarks.non_agentic_if_realworld.delivery import canonical_bytes, canonical_hash
 
@@ -93,3 +95,69 @@ async def test_first_complete_stream_is_scored_once_and_retained(
     projection = judge.call_args.args[0]
     assert projection["input_request"]["messages"] == messages
     assert projection["new_response"] == {"content": "Cedar.", "refusal": ""}
+
+
+@pytest.mark.asyncio
+async def test_hub_judge_validates_and_resumes_with_its_own_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    schema = {"type": "object", "required": ["item_id", "criteria"]}
+    (tmp_path / "judge.schema.json").write_text(json.dumps(schema))
+    (tmp_path / "rubric.md").write_text("Assess the single visible instruction.")
+    payload = {
+        "item_id": "synthetic",
+        "policy_version": "non-agentic-if-strict-response-grading-v2.2",
+        "input_request": {"messages": [{"role": "user", "content": "Say Cedar."}]},
+        "new_response": {"content": "Cedar.", "refusal": ""},
+        "criteria": [{"criterion_id": "cedar", "instruction_anchors": ["Say Cedar."]}],
+    }
+    review = {
+        "item_id": "synthetic",
+        "criteria": [
+            {
+                "criterion_id": "cedar",
+                "anchor_index": 0,
+                "assessment_status": "decided",
+                "grade": "pass",
+                "applicability": "active",
+                "materiality": "none",
+                "evidence_kind": "compliance",
+                "response_field": "content",
+                "response_quote": "Cedar.",
+                "exception_input_quote": "",
+                "review_reason": "",
+            }
+        ],
+    }
+    envelope = {
+        "model": judge_runtime.HUB_MODEL,
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(review)}}],
+    }
+    response = AsyncMock()
+    response.status = 200
+    response.read.return_value = canonical_bytes(envelope)
+    transport = AsyncMock(return_value=response)
+    monkeypatch.setenv(judge_runtime.HUB_KEY_ENV, "test-token")
+    monkeypatch.setattr(judge_runtime, "request", transport)
+    work = tmp_path / "hub"
+
+    result = await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE)
+    assert result["grade"] == "pass"
+    assert result["binding"]["profile"] == judge_runtime.INFERENCE_HUB_PROFILE
+    assert await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE) == result
+    with pytest.raises(ValueError, match="different input binding"):
+        await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.DIRECT_CODEX_PROFILE)
+    transport.assert_awaited_once()
+    assert transport.call_args.args == ("POST", judge_runtime.HUB_ENDPOINT)
+    assert transport.call_args.kwargs["allow_redirects"] is False
+    assert transport.call_args.kwargs["json"]["reasoning_effort"] == "medium"
+    assert transport.call_args.kwargs["json"]["response_format"]["json_schema"]["schema"] == schema
+
+    transport.reset_mock(side_effect=True)
+    transport.side_effect = ClientConnectionError("ambiguous dispatch")
+    work = tmp_path / "disconnect"
+    result = await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE)
+    assert result["grade"] is None
+    assert result["status"] == "interrupted_assessment"
+    assert await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE) == result
+    transport.assert_awaited_once()

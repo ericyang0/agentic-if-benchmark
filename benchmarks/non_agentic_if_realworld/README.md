@@ -29,9 +29,15 @@ Responses output, and visible judge projection are stored separately. Tool
 calls stay inert. This benchmark fixes the request controls, so run without
 additional overrides or repeats.
 
-Install and authenticate Codex on the driver for direct GPT-6.2 Sol judging
-with medium reasoning. The judge receives the frozen criteria and applicable
-delivery-specific rubric. Every criterion must pass for a scored pass. A valid
+For new EFB scores, select `NON_AGENTIC_IF_JUDGE_PROFILE=inference_hub_v1` and
+supply `NON_AGENTIC_IF_JUDGE_API_KEY` through your runtime secret configuration.
+The profile uses `openai/openai/gpt-6.2-sol` with medium reasoning and strict JSON
+over NVIDIA Inference Hub. The default standalone profile, `direct_codex_v1`,
+requires an authenticated Codex CLI. Start a fresh run directory when switching
+profiles. Each run records the active judge profile alongside the release.
+
+The judge receives the frozen criteria and applicable delivery-specific rubric.
+Every criterion must pass for a scored pass. A valid
 violation fails the item. Unresolved assessments and technical problems are
 reported as unscored. The complete accuracy metric requires valid grades for
 all 571 cases. Scores from bounded smoke runs carry the selected and scored

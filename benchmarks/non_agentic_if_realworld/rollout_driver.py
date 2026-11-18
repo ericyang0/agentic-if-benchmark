@@ -6,7 +6,6 @@ import asyncio
 import fcntl
 import json
 import os
-import shutil
 from collections import Counter
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -19,7 +18,7 @@ from nemo_gym.models import ChatCompletionsConverter, reconstruct_upstream_chat_
 from nemo_gym.rollouts import RolloutCollectionHelper
 
 from .delivery import canonical_bytes, canonical_hash, judge_projection, visible_delivery
-from .judge import assess
+from .judge import DIRECT_CODEX_PROFILE, assess, check_judge_configuration
 from .prepare import DEFAULT_DATA_DIR, ROOT, digest, fetch_release, prepared_rows, private_directory, records
 
 
@@ -86,6 +85,7 @@ async def _evaluate(
     context: int,
     manifest_hash: str,
     caps: list[int],
+    judge_profile: str = DIRECT_CODEX_PROFILE,
 ) -> dict:
     result_path = work / "result.json"
     if result_path.exists():
@@ -145,7 +145,7 @@ async def _evaluate(
             )
             if delivery_receipt is not None:
                 _write(work / "delivery.json", canonical_bytes(delivery_receipt) + b"\n")
-            grade = await assess(payload, dataset, work / "judge")
+            grade = await assess(payload, dataset, work / "judge", profile=judge_profile)
             output.update(
                 reward=float(grade["grade"] == "pass"),
                 mask_sample=grade["grade"] is None,
@@ -164,8 +164,8 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
     config = rollout_collection_config
     if config.num_repeats != 1 or config.fan_out or config.responses_create_params:
         raise ValueError("Frozen evaluation requires one repeat without fan-out or request overrides")
-    if shutil.which("codex") is None:
-        raise ValueError("Direct GPT-6.2 Sol grading requires the Codex CLI")
+    judge_profile = os.getenv("NON_AGENTIC_IF_JUDGE_PROFILE", DIRECT_CODEX_PROFILE)
+    judge_settings = check_judge_configuration(judge_profile)
     policy = global_config_dict["policy_model"]["responses_api_models"]["vllm_model"]
     if not policy["upstream_chat_stream"] or not policy["return_token_id_information"]:
         raise ValueError("Configure verified upstream Chat delivery and token capture")
@@ -204,7 +204,8 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
             "release": pin["artifacts"]["release_manifest.json"],
             "model": {key: served[0].get(key) for key in ("id", "root", "owned_by", "max_model_len")},
             "requested_ids": sorted(requested_ids),
-            "profile": manifest["profile"],
+            "release_profile": manifest["profile"],
+            "judge_profile": judge_settings,
             "runtime": {
                 name: digest(ROOT / name) for name in ("rollout_driver.py", "delivery.py", "scoring.py", "judge.py")
             },
@@ -232,6 +233,7 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
                     context=served[0]["max_model_len"],
                     manifest_hash=manifest_hash,
                     caps=manifest["profile"]["context_bounded_output_caps"],
+                    judge_profile=judge_profile,
                 )
 
         results = await asyncio.gather(*(evaluate(row) for row in requests))
