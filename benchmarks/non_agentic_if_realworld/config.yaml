@@ -5,7 +5,9 @@ non_agentic_if_realworld_agent:
     simple_agent:
       entrypoint: app.py
       model_server: {type: responses_api_models, name: policy_model}
-      execute_tools: false
+      # The rollout driver owns the policy turn and has no tool grants.
+      max_steps: 1
+      max_model_retries: 0
       skip_verification: true
       datasets:
         - name: non_agentic_if_realworld
