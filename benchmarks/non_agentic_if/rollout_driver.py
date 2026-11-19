@@ -8,7 +8,6 @@ import json
 import os
 from collections import Counter
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from aiohttp import ClientError
 
@@ -19,18 +18,16 @@ from nemo_gym.rollouts import RolloutCollectionHelper
 
 from .delivery import canonical_bytes, canonical_hash, judge_projection, visible_delivery
 from .judge import DIRECT_CODEX_PROFILE, assess, check_judge_configuration
-from .prepare import DEFAULT_DATA_DIR, ROOT, digest, fetch_release, prepared_rows, private_directory, records
-
-
-def _write(path: Path, data: bytes) -> None:
-    with NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        staging = Path(stream.name)
-        try:
-            stream.write(data)
-            stream.flush()
-            staging.replace(path)
-        finally:
-            staging.unlink(missing_ok=True)
+from .prepare import (
+    DEFAULT_DATA_DIR,
+    ROOT,
+    digest,
+    fetch_release,
+    prepared_rows,
+    private_directory,
+    records,
+    write_private_bytes,
+)
 
 
 def _stored_capture(completion: dict, captures: Path) -> tuple[dict, bytes, str]:
@@ -57,7 +54,7 @@ async def _completion(client: ServerClient, request: dict, directory: Path) -> d
         directory.mkdir(mode=0o700)
     except FileExistsError:
         return None
-    _write(directory / "request.json", canonical_bytes(request) + b"\n")
+    write_private_bytes(directory / "request.json", canonical_bytes(request) + b"\n")
     response = await client.request(
         server_name="policy_model",
         url_path="/v1/chat/completions",
@@ -68,7 +65,7 @@ async def _completion(client: ServerClient, request: dict, directory: Path) -> d
     async with response:
         response.raise_for_status()
         completion = await get_response_json(response)
-    _write(received, canonical_bytes(completion) + b"\n")
+    write_private_bytes(received, canonical_bytes(completion) + b"\n")
     return completion
 
 
@@ -103,7 +100,7 @@ async def _evaluate(
             count = tokens["count"]
             if type(count) is not int or count < 0:
                 raise ValueError("Missing verified prompt token count")
-            _write(profile_path, canonical_bytes({"count": count}) + b"\n")
+            write_private_bytes(profile_path, canonical_bytes({"count": count}) + b"\n")
         selected = None
         for cap in dict.fromkeys(min(value, context - count) for value in caps):
             if cap <= 0:
@@ -132,7 +129,7 @@ async def _evaluate(
             output["response"] = response.model_dump(mode="json")
             selection = {"item_id": row["id"], "capture_sha256": capture_hash, "profile": manifest_hash}
             selection_hash = canonical_hash(selection)
-            _write(work / "selection.json", canonical_bytes(selection) + b"\n")
+            write_private_bytes(work / "selection.json", canonical_bytes(selection) + b"\n")
             payload, delivery_receipt = judge_projection(
                 row=row,
                 criteria=criteria,
@@ -144,7 +141,7 @@ async def _evaluate(
                 source_verifier_sha256=digest(ROOT / "delivery.py"),
             )
             if delivery_receipt is not None:
-                _write(work / "delivery.json", canonical_bytes(delivery_receipt) + b"\n")
+                write_private_bytes(work / "delivery.json", canonical_bytes(delivery_receipt) + b"\n")
             grade = await assess(payload, dataset, work / "judge", profile=judge_profile)
             output.update(
                 reward=float(grade["grade"] == "pass"),
@@ -155,8 +152,8 @@ async def _evaluate(
     except (ClientError, TimeoutError, ValueError, KeyError) as error:
         output["failure_reason"] = type(error).__name__
     if output["mask_sample"]:
-        output["failure_kind"] = "non_agentic_if_realworld:" + output["status"]
-    _write(result_path, canonical_bytes(output) + b"\n")
+        output["failure_kind"] = "non_agentic_if:" + output["status"]
+    write_private_bytes(result_path, canonical_bytes(output) + b"\n")
     return output
 
 
@@ -164,6 +161,10 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
     config = rollout_collection_config
     if config.num_repeats != 1 or config.fan_out or config.responses_create_params:
         raise ValueError("Frozen evaluation requires one repeat without fan-out or request overrides")
+    if config.task_ids is not None or config.task_ids_fpath is not None:
+        raise ValueError("Select a bounded Non-Agentic IF run with --limit")
+    if config.limit is not None and config.limit <= 0:
+        raise ValueError("Non-Agentic IF requires a positive --limit")
     judge_profile = os.getenv("NON_AGENTIC_IF_JUDGE_PROFILE", DIRECT_CODEX_PROFILE)
     judge_settings = check_judge_configuration(judge_profile)
     policy = global_config_dict["policy_model"]["responses_api_models"]["vllm_model"]
@@ -216,7 +217,7 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
             raise ValueError("Existing run has a different model, dataset or sample binding")
         if identity.exists() and not config.resume_from_cache:
             raise ValueError("Use a fresh run directory or resume the existing evaluation")
-        _write(identity, canonical_bytes(binding) + b"\n")
+        write_private_bytes(identity, canonical_bytes(binding) + b"\n")
         slots = asyncio.Semaphore(config.num_samples_in_parallel or 1)
 
         async def evaluate(row: dict) -> dict:
@@ -237,7 +238,7 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
                 )
 
         results = await asyncio.gather(*(evaluate(row) for row in requests))
-        _write(output_file, b"".join(canonical_bytes(row) + b"\n" for row in results))
+        write_private_bytes(output_file, b"".join(canonical_bytes(row) + b"\n" for row in results))
         counts = Counter(row.get("grade") for row in results)
         decided = counts["pass"] + counts["fail"]
         aggregate = {
@@ -251,11 +252,11 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
             "composite/accuracy_among_scored": counts["pass"] / decided if decided else None,
         }
         document = {
-            "agent_ref": {"name": "non_agentic_if_realworld_agent"},
-            "_ng_environment_server": "non_agentic_if_realworld_environment",
+            "agent_ref": {"name": "non_agentic_if_agent"},
+            "_ng_environment_server": "non_agentic_if_environment",
             "agent_metrics": aggregate,
             "key_metrics": {"composite/complete_accuracy": aggregate["composite/complete_accuracy"]},
         }
-        _write(
+        write_private_bytes(
             output_file.with_name(f"{output_file.stem}_aggregate_metrics.json"), canonical_bytes([document]) + b"\n"
         )

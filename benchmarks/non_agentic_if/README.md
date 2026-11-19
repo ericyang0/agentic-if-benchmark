@@ -1,4 +1,4 @@
-# Real-world Non-Agentic Instruction Following
+# Non-Agentic Instruction Following
 
 The private release contains 571 historical regression cases and 686 atomic
 criteria. Every case is evaluation-only and development-exposed. One case was
@@ -11,12 +11,15 @@ Obtain read access to the approved private registry through your organization's
 access process. Install Gym with the `mlflow` extra and set the approved
 `mlflow_tracking_uri` and `mlflow_tracking_token` in your private configuration.
 Preparation verifies the release and every artifact before producing dataset
-rows. Supply owner-only cache and capture directories outside Git using
+rows. The prepared rows contain case identifiers with empty inputs. The
+rollout driver reads the exact messages from the verified private cache.
+Use the standard server-starting `gym eval run` path to invoke that driver.
+Supply owner-only cache and capture directories outside Git using
 `NON_AGENTIC_IF_DATA_DIR` and `NON_AGENTIC_IF_CAPTURE_DIR`.
 
 ```bash
-gym eval prepare --benchmark non_agentic_if_realworld
-gym eval run --benchmark non_agentic_if_realworld \
+gym eval prepare --benchmark non_agentic_if
+gym eval run --benchmark non_agentic_if \
   --limit 5 --output /path/to/owner-only-run/rollouts.jsonl
 ```
 

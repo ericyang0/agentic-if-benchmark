@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.non_agentic_if_realworld import prepare
+from benchmarks.non_agentic_if import prepare
 
 
-def test_preparation_preserves_message_order_and_roles(tmp_path: Path) -> None:
+def test_preparation_keeps_private_messages_out_of_collated_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     membership = {"id": "synthetic-case", "original_split": "train"}
     messages = [
         {"role": "system", "content": "Discuss fictional maps."},
@@ -28,15 +30,17 @@ def test_preparation_preserves_message_order_and_roles(tmp_path: Path) -> None:
     }.items():
         (tmp_path / filename).write_text(json.dumps(row) + "\n")
 
-    (row,) = prepare.prepared_rows(tmp_path, {"cases": 1, "criteria": 1})
-    inputs = row["responses_create_params"]["input"]
-    assert inputs[:3] == messages[:3]
-    assert inputs[3] == {
-        "role": "user",
-        "name": "cartographer",
-        "content": [{"type": "input_text", "text": "Start at the ferry."}],
-    }
+    pin = {"cases": 1, "criteria": 1}
+    (row,) = prepare.prepared_rows(tmp_path, pin)
+    assert row["responses_create_params"] == {"input": []}
     assert row["verifier_metadata"] == {"task_id": membership["id"]}
+    (tmp_path / "source_manifest.json").write_text(json.dumps(pin))
+    monkeypatch.setattr(prepare, "ROOT", tmp_path)
+    cache = tmp_path / "prepared.jsonl"
+    cache.write_text(json.dumps(row | {"responses_create_params": {"input": messages}}) + "\n")
+    assert not prepare.is_prepared_data_current(cache)
+    cache.write_text(json.dumps(row) + "\n")
+    assert prepare.is_prepared_data_current(cache)
 
     (tmp_path / "membership.jsonl").write_text(json.dumps({**membership, "original_split": "test"}) + "\n")
     with pytest.raises(ValueError, match="Request membership mismatch"):

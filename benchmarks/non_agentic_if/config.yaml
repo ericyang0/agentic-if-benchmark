@@ -1,6 +1,6 @@
 split: benchmark
-rollout_collection_driver: benchmarks.non_agentic_if_realworld.rollout_driver:run_rollout_collection
-non_agentic_if_realworld_agent:
+rollout_collection_driver: benchmarks.non_agentic_if.rollout_driver:run_rollout_collection
+non_agentic_if_agent:
   responses_api_agents:
     simple_agent:
       entrypoint: app.py
@@ -10,16 +10,16 @@ non_agentic_if_realworld_agent:
       max_model_retries: 0
       skip_verification: true
       datasets:
-        - name: non_agentic_if_realworld
+        - name: non_agentic_if
           type: benchmark
-          jsonl_fpath: benchmarks/non_agentic_if_realworld/data/prepared.jsonl
-          prepare_script: benchmarks/non_agentic_if_realworld/prepare.py
+          jsonl_fpath: benchmarks/non_agentic_if/data/prepared.jsonl
+          prepare_script: benchmarks/non_agentic_if/prepare.py
           num_repeats: 1
-non_agentic_if_realworld_environment:
+non_agentic_if_environment:
   environment_servers:
     legacy_agent:
       entrypoint: app.py
-      agent_server: {type: responses_api_agents, name: non_agentic_if_realworld_agent}
+      agent_server: {type: responses_api_agents, name: non_agentic_if_agent}
 policy_model:
   responses_api_models:
     vllm_model:
@@ -30,7 +30,7 @@ policy_model:
       uses_reasoning_parser: true
       uses_interleaved_reasoning: true
       upstream_chat_stream: true
-      upstream_chat_capture_dir: ${oc.env:NON_AGENTIC_IF_CAPTURE_DIR,${oc.env:HOME}/.cache/nemo-gym/non_agentic_if_realworld/captures}
+      upstream_chat_capture_dir: ${oc.env:NON_AGENTIC_IF_CAPTURE_DIR,${oc.env:HOME}/.cache/nemo-gym/non_agentic_if/captures}
       return_token_id_information: true
       request_prompt_and_generation_token_ids: true
       forward_request_chat_template_kwargs: true

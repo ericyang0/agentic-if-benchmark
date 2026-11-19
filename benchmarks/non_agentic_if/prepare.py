@@ -15,7 +15,7 @@ from nemo_gym.data import download_jsonl_dataset
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = Path.home() / ".cache/nemo-gym/non_agentic_if_realworld/1.0.0"
+DEFAULT_DATA_DIR = Path.home() / ".cache/nemo-gym/non_agentic_if/1.0.0"
 
 
 def digest(path: Path) -> str:
@@ -31,6 +31,16 @@ def private_directory(path: Path) -> Path:
     if path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
         raise ValueError("The benchmark cache must be owner-only")
     return path
+
+
+def write_private_bytes(path: Path, data: bytes) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        staging = Path(stream.name)
+    try:
+        staging.write_bytes(data)
+        staging.replace(path)
+    finally:
+        staging.unlink(missing_ok=True)
 
 
 def fetch_release(directory: Path, pin: dict) -> Path:
@@ -91,22 +101,22 @@ def prepared_rows(directory: Path, pin: dict) -> Iterator[dict]:
         item_id = row["id"]
         if row["membership"] != members[item_id]:
             raise ValueError("Request membership mismatch")
-        # The evaluation driver must send the original Chat request for exact history.
-        messages = row["baseline_request"]["messages"]
-        inputs = [
-            {
-                **message,
-                "content": [{"type": "input_text", "text": part["text"]} for part in message["content"]],
-            }
-            if isinstance(message["content"], list)
-            else message
-            for message in messages
-        ]
+        # Gym collates these rows into the run directory. Only the driver reads
+        # the exact private Chat request from the verified registry cache.
         yield {
             "task_id": item_id,
-            "responses_create_params": {"input": inputs},
+            "responses_create_params": {"input": []},
             "verifier_metadata": {"task_id": item_id},
         }
+
+
+def is_prepared_data_current(fpath: str | Path) -> bool:
+    path = Path(fpath)
+    pin = json.loads((ROOT / "source_manifest.json").read_bytes())
+    try:
+        return list(records(path)) == list(prepared_rows(path.resolve().parent, pin))
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 def prepare() -> Path:

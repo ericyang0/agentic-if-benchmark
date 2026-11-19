@@ -14,7 +14,7 @@ from aiohttp import ClientError, ClientTimeout
 from nemo_gym.client import request
 
 from .delivery import POLICIES, PROTOCOL, canonical_bytes, canonical_hash
-from .prepare import private_directory, records
+from .prepare import private_directory, records, write_private_bytes
 from .scoring import validate_review
 
 
@@ -202,35 +202,49 @@ async def assess(
         result = json.loads(result_file.read_bytes())
         if result["binding"] != binding:
             raise ValueError("Saved judge result has a different input binding")
-        if "response" in result and validate_review(result["response"], payload, schema)["grade"] != result["grade"]:
-            raise ValueError("Saved judgment differs from its validated response")
+        if "response" in result:
+            validated = validate_review(result["response"], payload, schema)
+            if any(result[field] != validated[field] for field in ("grade", "status")):
+                raise ValueError("Saved judgment differs from its validated response")
         return result
 
     for number in range(1, 5):
         attempt = root / f"attempt-{number}"
+        response_path = attempt / "response.json"
+        saved = attempt / "binding.json"
+        recovering = False
         try:
             attempt.mkdir(mode=0o700)
         except FileExistsError:
             # An interrupted request may have reached the judge. Keep its receipts for recovery.
-            saved = attempt / "binding.json"
-            if saved.exists() and json.loads(saved.read_bytes()) != binding:
-                raise ValueError("Existing judge attempt has a different input binding")
-            if not (attempt / "technical-failure").exists():
+            if not saved.is_file():
                 return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
-            continue
-        response_path = attempt / "response.json"
-        (attempt / "binding.json").write_bytes(canonical_bytes(binding) + b"\n")
+            if json.loads(saved.read_bytes()) != binding:
+                raise ValueError("Existing judge attempt has a different input binding")
+            if (attempt / "technical-failure").exists():
+                continue
+            if not response_path.is_file():
+                return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
+            recovering = True
+        else:
+            write_private_bytes(saved, canonical_bytes(binding) + b"\n")
         try:
-            if profile == INFERENCE_HUB_PROFILE:
+            if recovering:
+                if profile == DIRECT_CODEX_PROFILE:
+                    _validated_event_log(attempt / "events.jsonl")
+                response = json.loads(response_path.read_bytes())
+            elif profile == INFERENCE_HUB_PROFILE:
                 try:
                     response = await _hub_review(prompt, schema, attempt)
                 except (ClientError, TimeoutError):
                     return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
-                response_path.write_bytes(canonical_bytes(response) + b"\n")
+                write_private_bytes(response_path, canonical_bytes(response) + b"\n")
             else:
                 response = await _codex_review(prompt, schema_path, response_path)
-            grade = validate_review(response, payload, schema)["grade"]
+            validated = validate_review(response, payload, schema)
         except (OSError, TimeoutError, TypeError, ValueError, KeyError, jsonschema.ValidationError):
+            if recovering:
+                return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
             (attempt / "technical-failure").touch(exist_ok=False)
             status_path = attempt / "http-status"
             if status_path.is_file():
@@ -241,18 +255,18 @@ async def assess(
                 if status == 429 and number < 4:
                     await asyncio.sleep(65)
         else:
+            if validated["status"] == "validation_error":
+                (attempt / "technical-failure").touch(exist_ok=False)
+                continue
             result = {
                 "binding": binding,
-                "grade": grade,
+                "grade": validated["grade"],
                 "response": response,
                 "attempt": number,
-                "status": "graded" if grade is not None else "needs_adjudication",
+                "status": validated["status"],
             }
             break
     else:
         result = {"binding": binding, "grade": None, "status": "technical_attempts_exhausted"}
-    staging = root / ".result.json"
-    with staging.open("xb") as stream:
-        stream.write(canonical_bytes(result) + b"\n")
-    staging.replace(result_file)
+    write_private_bytes(result_file, canonical_bytes(result) + b"\n")
     return result

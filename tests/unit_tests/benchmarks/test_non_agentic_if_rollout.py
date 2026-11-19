@@ -9,9 +9,10 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import ClientConnectionError
 
-from benchmarks.non_agentic_if_realworld import judge as judge_runtime
-from benchmarks.non_agentic_if_realworld import rollout_driver
-from benchmarks.non_agentic_if_realworld.delivery import canonical_bytes, canonical_hash
+from benchmarks.non_agentic_if import judge as judge_runtime
+from benchmarks.non_agentic_if import rollout_driver
+from benchmarks.non_agentic_if.delivery import canonical_bytes, canonical_hash
+from benchmarks.non_agentic_if.scoring import validate_review
 
 
 @pytest.mark.asyncio
@@ -145,6 +146,8 @@ async def test_hub_judge_validates_and_resumes_with_its_own_profile(
     assert result["grade"] == "pass"
     assert result["binding"]["profile"] == judge_runtime.INFERENCE_HUB_PROFILE
     assert await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE) == result
+    (work / "result.json").unlink()
+    assert await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE) == result
     with pytest.raises(ValueError, match="different input binding"):
         await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.DIRECT_CODEX_PROFILE)
     transport.assert_awaited_once()
@@ -161,3 +164,69 @@ async def test_hub_judge_validates_and_resumes_with_its_own_profile(
     assert result["status"] == "interrupted_assessment"
     assert await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE) == result
     transport.assert_awaited_once()
+
+    transport.reset_mock(side_effect=True)
+    invalid = dict(review, criteria=[review["criteria"][0] | {"response_quote": "Pine."}])
+    invalid_envelope = dict(
+        envelope,
+        choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(invalid)}}],
+    )
+    response.read.side_effect = [canonical_bytes(invalid_envelope), canonical_bytes(envelope)]
+    result = await judge_runtime.assess(
+        payload, tmp_path, tmp_path / "invalid", profile=judge_runtime.INFERENCE_HUB_PROFILE
+    )
+    assert result["grade"] == "pass"
+    assert result["attempt"] == 2
+    assert transport.await_count == 2
+
+
+@pytest.mark.parametrize("invalid_quote", [False, True])
+def test_independent_failure_survives_an_invalid_criterion(invalid_quote: bool) -> None:
+    payload = {
+        "item_id": "synthetic",
+        "input_request": {"messages": [{"role": "user", "content": "Say Cedar and name its colour."}]},
+        "new_response": {"content": "Pine, green.", "refusal": ""},
+        "criteria": [
+            {"criterion_id": "cedar", "instruction_anchors": ["Say Cedar"]},
+            {
+                "criterion_id": "colour",
+                "instruction_anchors": ["name its colour"],
+                "depends_on": [] if invalid_quote else ["cedar"],
+            },
+        ],
+    }
+    evidence = {
+        "anchor_index": 0,
+        "assessment_status": "decided",
+        "applicability": "active",
+        "response_field": "content",
+        "review_reason": "",
+    }
+    results = validate_review(
+        {
+            "item_id": "synthetic",
+            "criteria": [
+                evidence
+                | {
+                    "criterion_id": "cedar",
+                    "grade": "fail",
+                    "materiality": "major",
+                    "evidence_kind": "direct_conflict",
+                    "response_quote": "Pine",
+                },
+                evidence
+                | {
+                    "criterion_id": "colour",
+                    "grade": "pass",
+                    "materiality": "none",
+                    "evidence_kind": "compliance",
+                    "response_quote": "purple" if invalid_quote else "green",
+                },
+            ],
+        },
+        payload,
+        {"type": "object"},
+    )
+    assert results["grade"] == "fail"
+    assert results["status"] == "graded"
+    assert [criterion["grade"] for criterion in results["criteria"]] == ["fail", None]
