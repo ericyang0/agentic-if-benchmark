@@ -38,7 +38,7 @@ from typing import (
     Optional,
 )
 
-from aiohttp import ClientError, ClientResponseError, ClientTimeout, ConnectionTimeoutError
+from aiohttp import ClientError, ClientPayloadError, ClientResponseError, ClientTimeout, ConnectionTimeoutError
 from pydantic import (
     BaseModel,
     Field,
@@ -910,6 +910,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         options = {
             "url": f"{self.base_url}/chat/completions",
             "json": {**kwargs, "stream": True, "stream_options": {"include_usage": True}},
+            "allow_redirects": False,
             "_resend_after_disconnect": False,
         }
         if headers:
@@ -919,7 +920,15 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             await self._raise_for_status(response, options)
             if response.content_type != "text/event-stream":
                 raise ValueError("The upstream Chat Completions response is not an event stream")
-            return await response.read()
+            raw = bytearray()
+            try:
+                async for chunk in response.content.iter_any():
+                    raw.extend(chunk)
+            except ClientPayloadError:
+                # The caller validates complete SSE semantics. A truncated HTTP trailer does not undo [DONE].
+                if not raw.rstrip().endswith(b"\ndata: [DONE]"):
+                    raise
+            return bytes(raw)
 
     async def create_completion(self, **kwargs):
         request_kwargs = dict(

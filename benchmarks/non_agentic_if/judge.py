@@ -57,6 +57,27 @@ def check_judge_configuration(profile: str) -> dict[str, str]:
     return settings
 
 
+async def check_judge_access(profile: str) -> None:
+    """Check the fixed Hub model before spending a policy generation."""
+    if profile != INFERENCE_HUB_PROFILE:
+        return
+    response = await request(
+        "GET",
+        HUB_ENDPOINT.removesuffix("/chat/completions") + "/models",
+        headers={"Authorization": "Bearer " + os.environ[HUB_KEY_ENV]},
+        timeout=ClientTimeout(total=30),
+        allow_redirects=False,
+        _max_num_tries=1,
+        _resend_after_disconnect=False,
+    )
+    async with response:
+        if response.status != 200:
+            raise ValueError(f"Inference Hub model access check returned HTTP {response.status}")
+        models = json.loads(await response.read())["data"]
+    if not any(model.get("id") == HUB_MODEL for model in models):
+        raise ValueError("The configured Inference Hub credential cannot access GPT-6.2 Sol")
+
+
 async def _hub_review(prompt: str, schema: dict, attempt: Path) -> dict:
     body = {
         "model": HUB_MODEL,
@@ -249,6 +270,10 @@ async def assess(
             status_path = attempt / "http-status"
             if status_path.is_file():
                 status = int(status_path.read_text())
+                if status in {401, 403}:
+                    raise RuntimeError(
+                        "Inference Hub denied judge access. Correct the credential and resume this run."
+                    )
                 if 300 <= status < 500 and status not in (408, 429):
                     result = {"binding": binding, "grade": None, "status": "judge_rejected_request", "attempt": number}
                     break

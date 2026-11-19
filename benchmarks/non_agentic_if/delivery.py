@@ -52,6 +52,8 @@ def visible_delivery(completion: dict, membership: dict) -> tuple[str, dict]:
     """Select the delivery policy without exposing reasoning or executing native actions."""
     choice = completion["choices"][0]
     finish, message = choice["finish_reason"], choice["message"]
+    if choice.get("native_finish_reason") == "repetition" or choice.get("stop_reason") == "repetition_detected":
+        raise ValueError("Provider stopped generation due to repetition")
     content, refusal = message.get("content"), message.get("refusal")
     if any(value is not None and not isinstance(value, str) for value in (content, refusal)):
         raise ValueError("Delivery contains unsupported visible fields")

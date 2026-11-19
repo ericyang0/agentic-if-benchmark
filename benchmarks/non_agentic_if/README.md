@@ -32,6 +32,11 @@ Responses output, and visible judge projection are stored separately. Tool
 calls stay inert. This benchmark fixes the request controls, so run without
 additional overrides or repeats.
 
+The rollout driver calls the stock Model Server's Chat route directly to
+preserve the frozen messages and request controls. There is no agent session
+or tool grant. The Environment Server reaggregates saved outcomes. Gym
+records one materialized input row per selected task before policy dispatch.
+
 For new EFB scores, select `NON_AGENTIC_IF_JUDGE_PROFILE=inference_hub_v1` and
 supply `NON_AGENTIC_IF_JUDGE_API_KEY` through your runtime secret configuration.
 The profile uses `openai/openai/gpt-6.2-sol` with medium reasoning and strict JSON
@@ -46,6 +51,12 @@ reported as unscored. The complete accuracy metric requires valid grades for
 all 571 cases. Scores from bounded smoke runs carry the selected and scored
 denominators.
 
+The archived GLM-5.3 run on this cohort has 256 passes, 315 failures and zero
+unscored cases out of 571, for a mean binary reward of 0.4483. It used seed 17
+and temperature 0.7. These grades describe the historical evaluation. Measure
+the current Gym and Inference Hub profile with a separate run.
+
 Keep rollout artifacts and judge receipts private. A new provider, judge model,
-or scoring protocol needs a separate run. Treat an interrupted policy or judge
-dispatch as ambiguous and retain the attempt directory when resuming.
+or scoring protocol needs a separate run. Resume can reuse a verified response
+or retry a connection that failed before dispatch. Reconcile ambiguous policy
+dispatches in the private run directory before resuming.

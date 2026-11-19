@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from aiohttp import ClientOSError, ClientResponseError, ClientTimeout
+from aiohttp import ClientOSError, ClientPayloadError, ClientResponseError, ClientTimeout
 from pydantic import ValidationError
 
 from nemo_gym.client import openai_client as openai_client_module
@@ -39,6 +39,33 @@ from nemo_gym.core.episode_context import rollout_context
 @pytest.fixture(autouse=True)
 def _jitter_at_its_upper_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("nemo_gym.client.openai_client.random.uniform", lambda low, high: high)
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+async def test_upstream_chat_read_error_preserves_a_received_terminal_event(monkeypatch, terminal: bool) -> None:
+    client = NeMoGymAsyncOpenAI(api_key="abc", base_url="https://example.com/v1")
+    raw = b'data: {"object":"chat.completion.chunk"}\n\n'
+    if terminal:
+        raw += b"data: [DONE]\n\n"
+
+    async def chunks():
+        yield raw
+        raise ClientPayloadError("truncated HTTP body")
+
+    response = MagicMock(content_type="text/event-stream")
+    response.content.iter_any.side_effect = chunks
+    request = AsyncMock(return_value=response)
+    monkeypatch.setattr(NeMoGymAsyncOpenAI, "_request", request)
+    monkeypatch.setattr(NeMoGymAsyncOpenAI, "_raise_for_status", AsyncMock())
+
+    if terminal:
+        assert await client.read_chat_completion_stream(model="synthetic") == raw
+    else:
+        with pytest.raises(ClientPayloadError):
+            await client.read_chat_completion_stream(model="synthetic")
+    request.assert_awaited_once()
+    assert request.call_args.kwargs["allow_redirects"] is False
+    assert request.call_args.kwargs["_resend_after_disconnect"] is False
 
 
 class TestOpenAIUtils:

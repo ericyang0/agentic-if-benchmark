@@ -6,18 +6,19 @@ import asyncio
 import fcntl
 import json
 import os
-from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from aiohttp import ClientError
+from aiohttp import ClientConnectorError, ClientError, ConnectionTimeoutError
 
 from nemo_gym.client import NeMoGymAsyncOpenAI, ServerClient, get_response_json
 from nemo_gym.core import NeMoGymChatCompletion, NeMoGymChatCompletionCreateParamsNonStreaming
 from nemo_gym.models import ChatCompletionsConverter, reconstruct_upstream_chat_completion
 from nemo_gym.rollouts import RolloutCollectionHelper
+from nemo_gym.utils import materialized_path_for
 
 from .delivery import canonical_bytes, canonical_hash, judge_projection, visible_delivery
-from .judge import DIRECT_CODEX_PROFILE, assess, check_judge_configuration
+from .judge import DIRECT_CODEX_PROFILE, assess, check_judge_access, check_judge_configuration
 from .prepare import (
     DEFAULT_DATA_DIR,
     ROOT,
@@ -46,25 +47,42 @@ def _stored_capture(completion: dict, captures: Path) -> tuple[dict, bytes, str]
     return evidence["request"], path.read_bytes(), capture_sha
 
 
-async def _completion(client: ServerClient, request: dict, directory: Path) -> dict | None:
+async def _completion(client: ServerClient, request: dict, directory: Path) -> dict:
     received = directory / "completion.json"
-    if received.exists():
-        return json.loads(received.read_bytes())
+    recorded = directory / "request.json"
+    not_sent = directory / "not-dispatched"
     try:
         directory.mkdir(mode=0o700)
     except FileExistsError:
-        return None
-    write_private_bytes(directory / "request.json", canonical_bytes(request) + b"\n")
-    response = await client.request(
-        server_name="policy_model",
-        url_path="/v1/chat/completions",
-        method="POST",
-        json=request,
-        _resend_after_disconnect=False,
-    )
-    async with response:
-        response.raise_for_status()
-        completion = await get_response_json(response)
+        if not recorded.is_file() or json.loads(recorded.read_bytes()) != request:
+            raise RuntimeError("Reconcile the saved policy request before resuming")
+        if received.is_file():
+            return json.loads(received.read_bytes())
+        if not not_sent.exists():
+            raise RuntimeError("Reconcile the ambiguous policy dispatch before resuming")
+        not_sent.unlink()
+    else:
+        write_private_bytes(recorded, canonical_bytes(request) + b"\n")
+    try:
+        response = await client.request(
+            server_name="policy_model",
+            url_path="/v1/chat/completions",
+            method="POST",
+            json=request,
+            allow_redirects=False,
+            _max_num_tries=1,
+            _resend_after_disconnect=False,
+        )
+        async with response:
+            response.raise_for_status()
+            completion = await get_response_json(response)
+    except (ClientConnectorError, ConnectionTimeoutError) as error:
+        not_sent.touch()
+        raise RuntimeError(
+            "Policy server connection failed before dispatch. Resume the same run after recovery."
+        ) from error
+    except (ClientError, TimeoutError, ValueError) as error:
+        raise RuntimeError("Reconcile the ambiguous policy dispatch before resuming") from error
     write_private_bytes(received, canonical_bytes(completion) + b"\n")
     return completion
 
@@ -107,8 +125,6 @@ async def _evaluate(
                 break
             request = base_request | {"max_tokens": cap, "stream": False}
             completion = await _completion(client, request, work / f"cap-{cap}")
-            if completion is None:
-                raise ValueError("An upstream model request may still be interrupted")
             wire, raw, capture_hash = _stored_capture(completion, captures)
             if any(wire.get(key) != value for key, value in request.items() if key != "stream"):
                 raise ValueError("Stock model server changed a frozen request field")
@@ -174,6 +190,15 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         raise ValueError("Configure verified upstream Chat delivery and token capture")
     if policy.get("refit_output_budget_to_window") or policy.get("refit_output_budget_to_prompt"):
         raise ValueError("The model server must preserve the selected output cap")
+    if policy.get("max_num_tries") != 1 or policy.get("max_http_attempts") != 1 or policy.get("sampling_overrides"):
+        raise ValueError("Non-Agentic IF requires one policy attempt and frozen sampling controls")
+    endpoint = urlsplit(policy["base_url"])
+    if (
+        endpoint.scheme not in {"http", "https"}
+        or not endpoint.hostname
+        or any((endpoint.username, endpoint.password, endpoint.query, endpoint.fragment))
+    ):
+        raise ValueError("Configure a policy base URL without embedded credentials")
     captures = private_directory(Path(policy["upstream_chat_capture_dir"]))
     pin = json.loads((ROOT / "source_manifest.json").read_bytes())
     dataset = fetch_release(Path(os.environ.get("NON_AGENTIC_IF_DATA_DIR") or DEFAULT_DATA_DIR), pin)
@@ -188,16 +213,23 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         prepared = list(records(Path(config.input_jsonl_fpath)))
         if [{key: row[key] for key in expected[0]} for row in prepared] != expected:
             raise ValueError("Prepared rollout input differs from the frozen population")
-        requested_ids = (
-            {row["task_id"] for row in expected[: config.limit]}
-            if config.limit
-            else {row["task_id"] for row in expected}
-        )
-        requests = [row for row in records(dataset / "requests.jsonl") if row["id"] in requested_ids]
+        selected = prepared[: config.limit]
+        helper = RolloutCollectionHelper()
+        rows = helper.preprocess_examples(selected, agent_map={"_default": "non_agentic_if_agent"})
+        by_id = {row["task_id"]: {**row, "_ng_environment_server": "non_agentic_if_environment"} for row in rows}
+        inventory = materialized_path_for(output_file)
+        inventory_bytes = b"".join(canonical_bytes(row) + b"\n" for row in by_id.values())
+        if inventory.exists():
+            if not config.resume_from_cache or inventory.read_bytes() != inventory_bytes:
+                raise ValueError("Materialized rollout inventory mismatch")
+        elif (directory / "run-binding.json").exists() or output_file.exists():
+            raise ValueError("Missing materialized rollout inventory. Reconcile this run before resuming.")
+        else:
+            write_private_bytes(inventory, inventory_bytes)
+        requests = [row for row in records(dataset / "requests.jsonl") if row["id"] in by_id]
         criteria = {row["id"]: row["criteria"] for row in records(dataset / "criteria.jsonl")}
         engine = NeMoGymAsyncOpenAI(base_url=policy["base_url"], api_key=policy["api_key"], max_http_attempts=1)
         model = policy["model"]
-        helper = RolloutCollectionHelper()
         client = helper.setup_server_client()
         served = [row for row in (await engine.create_models())["data"] if row["id"] == model]
         if len(served) != 1 or type(served[0].get("max_model_len")) is not int or served[0]["max_model_len"] <= 0:
@@ -206,11 +238,13 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         binding = {
             "release": pin["artifacts"]["release_manifest.json"],
             "model": {key: served[0].get(key) for key in ("id", "root", "owned_by", "max_model_len")},
-            "requested_ids": sorted(requested_ids),
+            "policy_base_url": policy["base_url"],
+            "requested_ids": sorted(by_id),
             "release_profile": manifest["profile"],
             "judge_profile": judge_settings,
             "runtime": {
-                name: digest(ROOT / name) for name in ("rollout_driver.py", "delivery.py", "scoring.py", "judge.py")
+                name: digest(ROOT / name)
+                for name in ("rollout_driver.py", "delivery.py", "scoring.py", "judge.py", "reporting.py")
             },
         }
         manifest_hash = canonical_hash(binding)
@@ -220,11 +254,13 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         if identity.exists() and not config.resume_from_cache:
             raise ValueError("Use a fresh run directory or resume the existing evaluation")
         write_private_bytes(identity, canonical_bytes(binding) + b"\n")
+        if any(not (directory / canonical_hash(row["id"]) / "result.json").is_file() for row in requests):
+            await check_judge_access(judge_profile)
         slots = asyncio.Semaphore(config.num_samples_in_parallel or 1)
 
         async def evaluate(row: dict) -> dict:
             async with slots:
-                return await _evaluate(
+                result = await _evaluate(
                     row,
                     criteria[row["id"]],
                     directory / canonical_hash(row["id"]),
@@ -239,26 +275,9 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
                     judge_profile=judge_profile,
                 )
 
+                return by_id[row["id"]] | result
+
         results = await asyncio.gather(*(evaluate(row) for row in requests))
         write_private_bytes(output_file, b"".join(canonical_bytes(row) + b"\n" for row in results))
-        counts = Counter(row.get("grade") for row in results)
-        decided = counts["pass"] + counts["fail"]
-        aggregate = {
-            "membership/expected": pin["cases"],
-            "membership/selected": len(results),
-            "count/pass": counts["pass"],
-            "count/fail": counts["fail"],
-            "count/unscored": counts[None],
-            "count/unattempted": pin["cases"] - len(results),
-            "composite/complete_accuracy": counts["pass"] / pin["cases"] if decided == pin["cases"] else None,
-            "composite/accuracy_among_scored": counts["pass"] / decided if decided else None,
-        }
-        document = {
-            "agent_ref": {"name": "non_agentic_if_agent"},
-            "_ng_environment_server": "non_agentic_if_environment",
-            "agent_metrics": aggregate,
-            "key_metrics": {"composite/complete_accuracy": aggregate["composite/complete_accuracy"]},
-        }
-        write_private_bytes(
-            output_file.with_name(f"{output_file.stem}_aggregate_metrics.json"), canonical_bytes([document]) + b"\n"
-        )
+        if not config.disable_aggregation:
+            await helper._call_aggregate_metrics(results, list(by_id.values()), output_file)

@@ -18,7 +18,7 @@ non_agentic_if_agent:
           num_repeats: 1
 non_agentic_if_environment:
   environment_servers:
-    legacy_agent:
+    non_agentic_if:
       entrypoint: app.py
       agent_server: {type: responses_api_agents, name: non_agentic_if_agent}
 policy_model:
@@ -39,3 +39,4 @@ policy_model:
       refit_output_budget_to_prompt: false
       max_num_tries: 1
       max_http_attempts: 1
+      sampling_overrides: null

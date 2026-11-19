@@ -8,12 +8,97 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiohttp import ClientConnectionError
+from aiohttp import ClientConnectionError, ConnectionTimeoutError
+from httpx import ASGITransport, AsyncClient
 
 from benchmarks.non_agentic_if import judge as judge_runtime
 from benchmarks.non_agentic_if import rollout_driver
-from benchmarks.non_agentic_if.delivery import canonical_bytes, canonical_hash
+from benchmarks.non_agentic_if.delivery import canonical_bytes, canonical_hash, visible_delivery
 from benchmarks.non_agentic_if.scoring import validate_review
+from environment_servers.non_agentic_if.app import NonAgenticIFEnvironmentServer
+from nemo_gym.config.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+from nemo_gym.models.model_call_capture import reconstruct_upstream_chat_completion
+
+
+@pytest.mark.parametrize(
+    "field,marker", [("native_finish_reason", "repetition"), ("stop_reason", "repetition_detected")]
+)
+def test_provider_repetition_is_not_scored_as_a_complete_answer(field: str, marker: str) -> None:
+    chunk = {"object": "chat.completion.chunk", "id": "synthetic", "model": "policy", "created": 2026}
+    events = [
+        chunk | {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "Cedar"}, field: marker}]},
+        chunk | {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop", field: "other"}]},
+    ]
+    raw = b"".join(b"data: " + canonical_bytes(event) + b"\n\n" for event in events) + b"data: [DONE]\n\n"
+    with pytest.raises(ValueError, match="repetition"):
+        visible_delivery(reconstruct_upstream_chat_completion(raw), {})
+
+
+@pytest.mark.parametrize("unsent", [True, False])
+async def test_policy_dispatch_resumes_only_if_known_unsent(tmp_path, monkeypatch, unsent: bool) -> None:
+    error_type = ConnectionTimeoutError if unsent else ClientConnectionError
+    response = AsyncMock()
+    response.raise_for_status = lambda: None
+    client = SimpleNamespace(request=AsyncMock(side_effect=[error_type("disconnected"), response]))
+    monkeypatch.setattr(rollout_driver, "get_response_json", AsyncMock(return_value={"id": "synthetic"}))
+    attempt = tmp_path / "attempt"
+    request = {"model": "policy", "seed": 17, "max_tokens": 32768}
+    with pytest.raises(RuntimeError, match="before dispatch" if unsent else "ambiguous policy dispatch"):
+        await rollout_driver._completion(client, request, attempt)
+    if unsent:
+        assert await rollout_driver._completion(client, request, attempt) == {"id": "synthetic"}
+        assert await rollout_driver._completion(client, request, attempt) == {"id": "synthetic"}
+        assert client.request.await_count == 2
+    else:
+        with pytest.raises(RuntimeError, match="ambiguous policy dispatch"):
+            await rollout_driver._completion(client, request, attempt)
+        client.request.assert_awaited_once()
+    for call in client.request.await_args_list:
+        assert call.kwargs["json"] == request
+        assert call.kwargs["_max_num_tries"] == 1
+        assert call.kwargs["_resend_after_disconnect"] is False
+
+
+async def test_environment_reaggregates_saved_outcomes_without_running_tasks() -> None:
+    app = NonAgenticIFEnvironmentServer.model_construct().setup_webserver()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        results = [
+            {
+                TASK_INDEX_KEY_NAME: index,
+                ROLLOUT_INDEX_KEY_NAME: 0,
+                "task_id": f"synthetic-{index}",
+                "reward": float(grade == "pass"),
+                "mask_sample": grade is None,
+                "grade": grade,
+            }
+            for index, grade in enumerate(("pass", "fail", None))
+        ]
+        response = await client.post("/aggregate_metrics", json={"verify_responses": results})
+        response.raise_for_status()
+        summary = response.json()
+        assert summary["key_metrics"]["composite/complete_accuracy"] is None
+        assert summary["agent_metrics"]["composite/accuracy_among_scored"] == 0.5
+        assert summary["agent_metrics"]["count/unattempted"] == 568
+        assert summary["agent_metrics"]["count/unscored"] == 1
+        assert len(summary["group_level_metrics"]) == 2
+        assert (await client.post("/run", json={})).status_code == 409
+
+
+@pytest.mark.parametrize("status, model", [(200, judge_runtime.HUB_MODEL), (200, "another-model"), (401, "")])
+async def test_hub_preflight_checks_access_without_a_judge_dispatch(monkeypatch, status: int, model: str) -> None:
+    monkeypatch.setenv(judge_runtime.HUB_KEY_ENV, "test-token")
+    response = AsyncMock(status=status)
+    response.read.return_value = canonical_bytes({"data": [{"id": model}]})
+    request = AsyncMock(return_value=response)
+    monkeypatch.setattr(judge_runtime, "request", request)
+    if model == judge_runtime.HUB_MODEL:
+        await judge_runtime.check_judge_access(judge_runtime.INFERENCE_HUB_PROFILE)
+    else:
+        with pytest.raises(ValueError, match="access"):
+            await judge_runtime.check_judge_access(judge_runtime.INFERENCE_HUB_PROFILE)
+    request.assert_awaited_once()
+    assert request.call_args.args[0] == "GET"
+    assert request.call_args.args[1].endswith("/v1/models")
 
 
 @pytest.mark.asyncio
@@ -41,8 +126,9 @@ async def test_unsafe_run_settings_fail_before_model_setup(overrides: dict, erro
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("grade", ["pass", "fail"])
 async def test_first_complete_stream_is_scored_once_and_retained(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grade: str
 ) -> None:
     messages = [{"role": "user", "name": "planner", "content": "Say Cedar."}]
     baseline = {"model": "frozen-model", "messages": messages, "temperature": 0.7, "seed": 17, "stream": False}
@@ -52,7 +138,7 @@ async def test_first_complete_stream_is_scored_once_and_retained(
         "baseline_provenance": {"input_sha256": canonical_hash({"messages": messages})},
         "membership": {"original_split": "train", "reserved_sep4": False, "benchmark_role": "development_exposed"},
     }
-    wire = {**baseline, "model": "policy", "max_tokens": 32768, "stream": True}
+    wire = {**baseline, "model": "policy", "max_tokens": 65536, "stream": True}
     event = {
         "id": "chatcmpl-synthetic",
         "object": "chat.completion.chunk",
@@ -92,8 +178,21 @@ async def test_first_complete_stream_is_scored_once_and_retained(
         ],
         "metrics": {"upstream_chat_capture_sha256": capture_hash, "upstream_chat_stream_sha256": raw_hash},
     }
-    generate = AsyncMock(return_value=completion)
-    judge = AsyncMock(return_value={"grade": "pass", "status": "graded"})
+    incomplete_event = event | {"choices": [event["choices"][0] | {"finish_reason": "length"}]}
+    incomplete_raw = b"data: " + canonical_bytes(incomplete_event) + b"\n\ndata: [DONE]\n\n"
+    incomplete_hash = hashlib.sha256(incomplete_raw).hexdigest()
+    incomplete_receipt = {"request": wire | {"max_tokens": 32768}, "response_sha256": incomplete_hash}
+    incomplete_capture = canonical_hash(incomplete_receipt)
+    (tmp_path / f"{incomplete_hash}.sse").write_bytes(incomplete_raw)
+    (tmp_path / f"{incomplete_capture}.json").write_bytes(canonical_bytes(incomplete_receipt))
+    incomplete = completion | {
+        "metrics": {
+            "upstream_chat_capture_sha256": incomplete_capture,
+            "upstream_chat_stream_sha256": incomplete_hash,
+        },
+    }
+    generate = AsyncMock(side_effect=[incomplete, completion])
+    judge = AsyncMock(return_value={"grade": grade, "status": "graded"})
     monkeypatch.setattr(rollout_driver, "_completion", generate)
     monkeypatch.setattr(rollout_driver, "assess", judge)
     engine = AsyncMock()
@@ -111,12 +210,13 @@ async def test_first_complete_stream_is_scored_once_and_retained(
     resumed = await rollout_driver._evaluate(row, criteria, tmp_path / "work", tmp_path, tmp_path, **kwargs)
 
     assert result == resumed
-    assert result["reward"] == 1
+    assert result["reward"] == float(grade == "pass")
     assert result["mask_sample"] is False
     assert "Private reasoning." in json.dumps(result["response"])
     assert any(item.get("generation_token_ids") == [3, 4] for item in result["response"]["output"])
     assert any(item.get("generation_log_probs") == [-0.1, -0.2] for item in result["response"]["output"])
-    generate.assert_awaited_once()
+    assert [call.args[1]["max_tokens"] for call in generate.await_args_list] == [32768, 65536]
+    assert all(call.args[1]["seed"] == 17 for call in generate.await_args_list)
     judge.assert_awaited_once()
     projection = judge.call_args.args[0]
     assert projection["input_request"]["messages"] == messages
@@ -255,3 +355,76 @@ def test_independent_failure_survives_an_invalid_criterion(invalid_quote: bool) 
     assert results["grade"] == "fail"
     assert results["status"] == "graded"
     assert [criterion["grade"] for criterion in results["criteria"]] == ["fail", None]
+
+
+async def test_run_materializes_selected_tasks_before_dispatch_and_checks_resume(tmp_path, monkeypatch) -> None:
+    pin = {"cases": 2, "artifacts": {"release_manifest.json": "a" * 64}}
+    asset = tmp_path / "assets"
+    asset.mkdir(mode=0o700)
+    (asset / "source_manifest.json").write_text(json.dumps(pin))
+    (asset / "release_manifest.json").write_text(json.dumps({"profile": {"context_bounded_output_caps": [32768]}}))
+    ids = ("first-fictional", "second-fictional")
+    prepared = [
+        {"task_id": task, "responses_create_params": {"input": []}, "verifier_metadata": {"task_id": task}}
+        for task in ids
+    ]
+    for name, rows in {
+        "requests.jsonl": [{"id": task} for task in ids],
+        "criteria.jsonl": [{"id": task, "criteria": []} for task in ids],
+        "prepared.jsonl": prepared,
+    }.items():
+        (asset / name).write_bytes(b"".join(canonical_bytes(row) + b"\n" for row in rows))
+    output = tmp_path / "run" / "rollouts.jsonl"
+    inventory = rollout_driver.materialized_path_for(output)
+    config = SimpleNamespace(
+        upload_rollouts=False,
+        num_repeats=1,
+        fan_out=False,
+        responses_create_params={},
+        task_ids=None,
+        task_ids_fpath=None,
+        limit=1,
+        resume_from_cache=True,
+        num_samples_in_parallel=1,
+        disable_aggregation=True,
+        input_jsonl_fpath=asset / "prepared.jsonl",
+        output_jsonl_fpath=output,
+    )
+    policy = {
+        "base_url": "http://localhost:8000/v1",
+        "model": "policy",
+        "api_key": "test-token",
+        "upstream_chat_stream": True,
+        "return_token_id_information": True,
+        "upstream_chat_capture_dir": str(tmp_path / "captures"),
+        "max_num_tries": 1,
+        "max_http_attempts": 1,
+    }
+    monkeypatch.setattr(rollout_driver, "ROOT", asset)
+    monkeypatch.setattr(rollout_driver, "digest", lambda _: "b" * 64)
+    monkeypatch.setattr(rollout_driver, "fetch_release", lambda *_: asset)
+    monkeypatch.setattr(rollout_driver, "prepared_rows", lambda *_: iter(prepared))
+    monkeypatch.setattr(rollout_driver, "check_judge_configuration", lambda _: {})
+    monkeypatch.setattr(rollout_driver.RolloutCollectionHelper, "setup_server_client", lambda self: None)
+    engine = SimpleNamespace(
+        create_models=AsyncMock(return_value={"data": [{"id": "policy", "max_model_len": 65536}]})
+    )
+    monkeypatch.setattr(rollout_driver, "NeMoGymAsyncOpenAI", lambda **_: engine)
+
+    async def evaluate(row, *_args, **_kwargs):
+        items = list(rollout_driver.records(inventory))
+        assert [item["task_id"] for item in items] == [ids[0]]
+        assert row["id"] == ids[0]
+        return {"task_id": row["id"], "grade": "pass", "reward": 1, "mask_sample": False}
+
+    evaluation = AsyncMock(side_effect=evaluate)
+    monkeypatch.setattr(rollout_driver, "_evaluate", evaluation)
+    resolved = {"policy_model": {"responses_api_models": {"vllm_model": policy}}}
+    await rollout_driver.run_rollout_collection(config, resolved)
+    (item,) = list(rollout_driver.records(output))
+    assert item[TASK_INDEX_KEY_NAME] == 0 and item[ROLLOUT_INDEX_KEY_NAME] == 0
+    assert inventory.stat().st_mode & 0o777 == 0o600
+    inventory.write_text("{}\n")
+    with pytest.raises(ValueError, match="inventory mismatch"):
+        await rollout_driver.run_rollout_collection(config, resolved)
+    evaluation.assert_awaited_once()

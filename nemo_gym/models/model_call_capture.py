@@ -623,6 +623,9 @@ def reconstruct_upstream_chat_completion(raw: bytes) -> dict[str, Any]:
                 raise ValueError(f"Conflicting upstream {key}")
             result[key] = values[0]
     reconstructed = result["choices"][0]
+    for key, marker in (("native_finish_reason", "repetition"), ("stop_reason", "repetition_detected")):
+        if any(choice.get(key) == marker for choice in choices):
+            reconstructed[key] = marker
     choice_token_ids = [choice["token_ids"] for choice in choices if choice.get("token_ids") is not None]
     if choice_token_ids:
         reconstructed["token_ids"] = [token_id for chunk_ids in choice_token_ids for token_id in chunk_ids]
