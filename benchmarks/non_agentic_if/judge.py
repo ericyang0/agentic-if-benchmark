@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+from itertools import count
 from pathlib import Path
 
 import jsonschema
@@ -25,6 +26,10 @@ HUB_ENDPOINT = "https://inference-api.nvidia.com/v1/chat/completions"
 HUB_MODEL = "openai/openai/gpt-6.2-sol"
 HUB_KEY_ENV = "NON_AGENTIC_IF_JUDGE_API_KEY"
 REASONING = "medium"
+MAX_REVIEW_ATTEMPTS = 4
+MAX_REQUESTS_PER_INVOCATION = 4
+HUB_ACCESS_ERRORS = {401, 403, 404}
+HUB_RETRYABLE_CLIENT_ERRORS = HUB_ACCESS_ERRORS | {408, 429}
 DISABLED_FEATURES = (
     "shell_tool",
     "multi_agent",
@@ -58,8 +63,20 @@ def check_judge_configuration(profile: str) -> dict[str, str]:
 
 
 async def check_judge_access(profile: str) -> None:
-    """Check the fixed Hub model before spending a policy generation."""
-    if profile != INFERENCE_HUB_PROFILE:
+    """Check judge access before spending a policy generation."""
+    if profile == DIRECT_CODEX_PROFILE:
+        process = await asyncio.create_subprocess_exec(
+            "codex", "login", "status", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        try:
+            exit_code = await asyncio.wait_for(process.wait(), timeout=30)
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        if exit_code:
+            raise ValueError("Direct GPT-6.2 Sol grading requires an authenticated Codex CLI")
         return
     response = await request(
         "GET",
@@ -229,11 +246,18 @@ async def assess(
                 raise ValueError("Saved judgment differs from its validated response")
         return result
 
-    for number in range(1, 5):
+    reviews = requests = 0
+    for number in count(1):
+        if reviews >= MAX_REVIEW_ATTEMPTS:
+            result = {"binding": binding, "grade": None, "status": "technical_attempts_exhausted"}
+            break
         attempt = root / f"attempt-{number}"
         response_path = attempt / "response.json"
         saved = attempt / "binding.json"
+        status_path = attempt / "http-status"
         recovering = False
+        if requests >= MAX_REQUESTS_PER_INVOCATION:
+            raise RuntimeError("Judge request retry budget reached. Resume to grade the saved policy response.")
         try:
             attempt.mkdir(mode=0o700)
         except FileExistsError:
@@ -242,12 +266,19 @@ async def assess(
                 return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
             if json.loads(saved.read_bytes()) != binding:
                 raise ValueError("Existing judge attempt has a different input binding")
-            if (attempt / "technical-failure").exists():
+            status = int(status_path.read_text()) if status_path.is_file() else None
+            if status is not None and 300 <= status < 500 and status not in HUB_RETRYABLE_CLIENT_ERRORS:
+                result = {"binding": binding, "grade": None, "status": "judge_rejected_request", "attempt": number}
+                break
+            if (attempt / "technical-failure").exists() or (status is not None and status != 200):
+                if status is None or 200 <= status < 300:
+                    reviews += 1
                 continue
             if not response_path.is_file():
                 return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
             recovering = True
         else:
+            requests += 1
             write_private_bytes(saved, canonical_bytes(binding) + b"\n")
         try:
             if recovering:
@@ -267,21 +298,25 @@ async def assess(
             if recovering:
                 return {"binding": binding, "grade": None, "status": "interrupted_assessment"}
             (attempt / "technical-failure").touch(exist_ok=False)
-            status_path = attempt / "http-status"
             if status_path.is_file():
                 status = int(status_path.read_text())
-                if status in {401, 403}:
+                if status in HUB_ACCESS_ERRORS:
                     raise RuntimeError(
-                        "Inference Hub denied judge access. Correct the credential and resume this run."
+                        "Inference Hub denied judge access. Verify the credential and model access, then resume."
                     )
-                if 300 <= status < 500 and status not in (408, 429):
+                if 300 <= status < 500 and status not in HUB_RETRYABLE_CLIENT_ERRORS:
                     result = {"binding": binding, "grade": None, "status": "judge_rejected_request", "attempt": number}
                     break
-                if status == 429 and number < 4:
+                if status == 429 and requests < MAX_REQUESTS_PER_INVOCATION:
                     await asyncio.sleep(65)
+                if 200 <= status < 300:
+                    reviews += 1
+            else:
+                reviews += 1
         else:
             if validated["status"] == "validation_error":
                 (attempt / "technical-failure").touch(exist_ok=False)
+                reviews += 1
                 continue
             result = {
                 "binding": binding,
@@ -291,7 +326,5 @@ async def assess(
                 "status": validated["status"],
             }
             break
-    else:
-        result = {"binding": binding, "grade": None, "status": "technical_attempts_exhausted"}
     write_private_bytes(result_file, canonical_bytes(result) + b"\n")
     return result

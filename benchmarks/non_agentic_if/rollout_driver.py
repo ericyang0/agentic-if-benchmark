@@ -31,6 +31,47 @@ from .prepare import (
 )
 
 
+FROZEN_CHAT_FIELDS = {
+    "chat_template_kwargs",
+    "max_tokens",
+    "messages",
+    "model",
+    "reasoning_effort",
+    "seed",
+    "stream",
+    "temperature",
+    "top_p",
+}
+
+
+def _policy_request(row: dict, model: str) -> dict:
+    frozen = row["baseline_request"]
+    if frozen.keys() - FROZEN_CHAT_FIELDS:
+        raise ValueError("Frozen policy requests cannot include provider-managed context or tool grants")
+    if canonical_hash({"messages": frozen["messages"]}) != row["baseline_provenance"]["input_sha256"]:
+        raise ValueError("Policy messages differ from the frozen input")
+    return {**frozen, "model": model}
+
+
+def _saved_result(path: Path, task_id: str, run_hash: str, captures: Path) -> dict:
+    record = json.loads(path.read_bytes())
+    saved = record.get("result") if isinstance(record, dict) else None
+    result = saved.get("output") if isinstance(saved, dict) else None
+    if (
+        not isinstance(result, dict)
+        or saved.get("run") != run_hash
+        or result.get("task_id") != task_id
+        or record.get("sha256") != canonical_hash(saved)
+    ):
+        raise ValueError("Saved rollout differs from its original result or run binding")
+    for root, receipts in ((path.parent, saved["work_receipts"]), (captures, saved["captures"])):
+        for name, expected in receipts.items():
+            receipt = (root / name).resolve()
+            if not receipt.is_relative_to(root.resolve()) or not receipt.is_file() or digest(receipt) != expected:
+                raise ValueError("Saved rollout evidence differs from its original receipts")
+    return result
+
+
 def _stored_capture(completion: dict, captures: Path) -> tuple[dict, bytes, str]:
     metrics = completion["metrics"]
     capture_sha = metrics["upstream_chat_capture_sha256"]
@@ -104,10 +145,12 @@ async def _evaluate(
 ) -> dict:
     result_path = work / "result.json"
     if result_path.exists():
-        return json.loads(result_path.read_bytes())
+        return _saved_result(result_path, row["id"], manifest_hash, captures)
     work.mkdir(mode=0o700, exist_ok=True)
     output = {"task_id": row["id"], "reward": 0.0, "mask_sample": True, "status": "unscored_delivery"}
-    base_request = row["baseline_request"] | {"model": model}
+    work_receipts = []
+    capture_receipts = {}
+    base_request = _policy_request(row, model)
     fields = ("model", "messages", "chat_template_kwargs")
     try:
         profile_path = work / "profile.json"
@@ -146,6 +189,9 @@ async def _evaluate(
             selection = {"item_id": row["id"], "capture_sha256": capture_hash, "profile": manifest_hash}
             selection_hash = canonical_hash(selection)
             write_private_bytes(work / "selection.json", canonical_bytes(selection) + b"\n")
+            work_receipts.extend(["selection.json", f"cap-{request['max_tokens']}/completion.json"])
+            stream_hash = completion["metrics"]["upstream_chat_stream_sha256"]
+            capture_receipts = {f"{capture_hash}.json": capture_hash, f"{stream_hash}.sse": stream_hash}
             payload, delivery_receipt = judge_projection(
                 row=row,
                 criteria=criteria,
@@ -158,7 +204,12 @@ async def _evaluate(
             )
             if delivery_receipt is not None:
                 write_private_bytes(work / "delivery.json", canonical_bytes(delivery_receipt) + b"\n")
+                work_receipts.append("delivery.json")
             grade = await assess(payload, dataset, work / "judge", profile=judge_profile)
+            if grade["status"] == "interrupted_assessment":
+                raise RuntimeError("Reconcile the ambiguous judge dispatch before resuming")
+            if (work / "judge/result.json").is_file():
+                work_receipts.append("judge/result.json")
             output.update(
                 reward=float(grade["grade"] == "pass"),
                 mask_sample=grade["grade"] is None,
@@ -169,7 +220,13 @@ async def _evaluate(
         output["failure_reason"] = type(error).__name__
     if output["mask_sample"]:
         output["failure_kind"] = "non_agentic_if:" + output["status"]
-    write_private_bytes(result_path, canonical_bytes(output) + b"\n")
+    saved = {
+        "output": output,
+        "run": manifest_hash,
+        "work_receipts": {name: digest(work / name) for name in work_receipts},
+        "captures": capture_receipts,
+    }
+    write_private_bytes(result_path, canonical_bytes({"result": saved, "sha256": canonical_hash(saved)}) + b"\n")
     return output
 
 
@@ -192,6 +249,8 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         raise ValueError("The model server must preserve the selected output cap")
     if policy.get("max_num_tries") != 1 or policy.get("max_http_attempts") != 1 or policy.get("sampling_overrides"):
         raise ValueError("Non-Agentic IF requires one policy attempt and frozen sampling controls")
+    if policy.get("extra_body"):
+        raise ValueError("Non-Agentic IF requires the frozen policy request without Model Server extra_body overrides")
     endpoint = urlsplit(policy["base_url"])
     if (
         endpoint.scheme not in {"http", "https"}
@@ -254,11 +313,18 @@ async def run_rollout_collection(rollout_collection_config, global_config_dict) 
         if identity.exists() and not config.resume_from_cache:
             raise ValueError("Use a fresh run directory or resume the existing evaluation")
         write_private_bytes(identity, canonical_bytes(binding) + b"\n")
-        if any(not (directory / canonical_hash(row["id"]) / "result.json").is_file() for row in requests):
+        completed = {}
+        for row in requests:
+            result_path = directory / canonical_hash(row["id"]) / "result.json"
+            if result_path.is_file():
+                completed[row["id"]] = _saved_result(result_path, row["id"], manifest_hash, captures)
+        if len(completed) < len(requests):
             await check_judge_access(judge_profile)
         slots = asyncio.Semaphore(config.num_samples_in_parallel or 1)
 
         async def evaluate(row: dict) -> dict:
+            if row["id"] in completed:
+                return by_id[row["id"]] | completed[row["id"]]
             async with slots:
                 result = await _evaluate(
                     row,

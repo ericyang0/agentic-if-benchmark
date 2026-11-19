@@ -60,3 +60,6 @@ Keep rollout artifacts and judge receipts private. A new provider, judge model,
 or scoring protocol needs a separate run. Resume can reuse a verified response
 or retry a connection that failed before dispatch. Reconcile ambiguous policy
 dispatches in the private run directory before resuming.
+
+See the [review audit](validation.md) for the Agentic IF reviewer findings
+and how they were checked against this benchmark.

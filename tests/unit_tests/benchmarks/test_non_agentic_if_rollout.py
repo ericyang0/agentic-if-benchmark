@@ -34,6 +34,30 @@ def test_provider_repetition_is_not_scored_as_a_complete_answer(field: str, mark
         visible_delivery(reconstruct_upstream_chat_completion(raw), {})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("conversation", "conv_fixture"),
+        ("conversation", {"id": "conv_fixture"}),
+        ("conversation", ""),
+        ("previous_response_id", "resp_fixture"),
+        ("prompt", {"id": "prompt_fixture"}),
+        ("instructions", "Use a different system instruction."),
+        ("tools", [{"type": "function", "function": {"name": "fixture"}}]),
+    ],
+)
+def test_frozen_policy_fields_reject_provider_context_and_tools(field: str, value: object) -> None:
+    messages = [{"role": "user", "content": "Say Cedar."}]
+    row = {
+        "baseline_request": {"messages": messages, "model": "fixture", field: value},
+        "baseline_provenance": {"input_sha256": canonical_hash({"messages": messages})},
+    }
+    with pytest.raises(ValueError, match="provider-managed context or tool grants"):
+        rollout_driver._policy_request(row, "test-model")
+    del row["baseline_request"][field]
+    assert rollout_driver._policy_request(row, "test-model") == {"messages": messages, "model": "test-model"}
+
+
 @pytest.mark.parametrize("unsent", [True, False])
 async def test_policy_dispatch_resumes_only_if_known_unsent(tmp_path, monkeypatch, unsent: bool) -> None:
     error_type = ConnectionTimeoutError if unsent else ClientConnectionError
@@ -99,6 +123,14 @@ async def test_hub_preflight_checks_access_without_a_judge_dispatch(monkeypatch,
     request.assert_awaited_once()
     assert request.call_args.args[0] == "GET"
     assert request.call_args.args[1].endswith("/v1/models")
+
+
+async def test_direct_judge_checks_login_before_generation(monkeypatch) -> None:
+    start = AsyncMock(return_value=SimpleNamespace(wait=AsyncMock(return_value=1)))
+    monkeypatch.setattr(judge_runtime.asyncio, "create_subprocess_exec", start)
+    with pytest.raises(ValueError, match="authenticated Codex CLI"):
+        await judge_runtime.check_judge_access(judge_runtime.DIRECT_CODEX_PROFILE)
+    assert start.call_args.args == ("codex", "login", "status")
 
 
 @pytest.mark.asyncio
@@ -191,7 +223,15 @@ async def test_first_complete_stream_is_scored_once_and_retained(
             "upstream_chat_stream_sha256": incomplete_hash,
         },
     }
-    generate = AsyncMock(side_effect=[incomplete, completion])
+    completions = iter([incomplete, completion])
+
+    async def deliver(_client, _request, directory):
+        response = next(completions)
+        directory.mkdir()
+        (directory / "completion.json").write_bytes(canonical_bytes(response))
+        return response
+
+    generate = AsyncMock(side_effect=deliver)
     judge = AsyncMock(return_value={"grade": grade, "status": "graded"})
     monkeypatch.setattr(rollout_driver, "_completion", generate)
     monkeypatch.setattr(rollout_driver, "assess", judge)
@@ -221,6 +261,20 @@ async def test_first_complete_stream_is_scored_once_and_retained(
     projection = judge.call_args.args[0]
     assert projection["input_request"]["messages"] == messages
     assert projection["new_response"] == {"content": "Cedar.", "refusal": ""}
+
+    capture_path = tmp_path / f"{raw_hash}.sse"
+    capture_path.write_bytes(raw + b"corruption")
+    with pytest.raises(ValueError, match="original receipts"):
+        await rollout_driver._evaluate(row, criteria, tmp_path / "work", tmp_path, tmp_path, **kwargs)
+    capture_path.write_bytes(raw)
+    saved_path = tmp_path / "work" / "result.json"
+    saved = json.loads(saved_path.read_bytes())
+    saved["result"]["output"]["reward"] = 1 - result["reward"]
+    saved_path.write_bytes(canonical_bytes(saved))
+    with pytest.raises(ValueError, match="original result or run binding"):
+        await rollout_driver._evaluate(row, criteria, tmp_path / "work", tmp_path, tmp_path, **kwargs)
+    assert generate.await_count == 2
+    judge.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -303,6 +357,22 @@ async def test_hub_judge_validates_and_resumes_with_its_own_profile(
     assert result["grade"] == "pass"
     assert result["attempt"] == 2
     assert transport.await_count == 2
+
+    transport.reset_mock()
+    response.read.side_effect = None
+    work = tmp_path / "access-recovery"
+    for status in (401, 403, 404, 401):
+        response.status = status
+        response.read.return_value = b"{}"
+        with pytest.raises(RuntimeError, match="denied judge access"):
+            await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE)
+        assert not (work / "result.json").exists()
+    (work / "attempt-4" / "technical-failure").unlink()
+    response.status = 200
+    response.read.return_value = canonical_bytes(envelope)
+    result = await judge_runtime.assess(payload, tmp_path, work, profile=judge_runtime.INFERENCE_HUB_PROFILE)
+    assert result["grade"] == "pass" and result["attempt"] == 5
+    assert transport.await_count == 5
 
 
 @pytest.mark.parametrize("invalid_quote", [False, True])
