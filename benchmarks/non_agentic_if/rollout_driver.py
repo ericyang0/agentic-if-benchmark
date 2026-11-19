@@ -159,6 +159,8 @@ async def _evaluate(
 
 async def run_rollout_collection(rollout_collection_config, global_config_dict) -> None:
     config = rollout_collection_config
+    if config.upload_rollouts:
+        raise ValueError("Non-Agentic IF requires upload_rollouts=false to keep rollouts private")
     if config.num_repeats != 1 or config.fan_out or config.responses_create_params:
         raise ValueError("Frozen evaluation requires one repeat without fan-out or request overrides")
     if config.task_ids is not None or config.task_ids_fpath is not None:

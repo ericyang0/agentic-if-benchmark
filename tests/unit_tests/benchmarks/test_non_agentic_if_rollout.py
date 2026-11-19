@@ -4,6 +4,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,30 @@ from benchmarks.non_agentic_if import judge as judge_runtime
 from benchmarks.non_agentic_if import rollout_driver
 from benchmarks.non_agentic_if.delivery import canonical_bytes, canonical_hash
 from benchmarks.non_agentic_if.scoring import validate_review
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"upload_rollouts": True}, "keep rollouts private"),
+        ({"task_ids": ["synthetic"]}, "with --limit"),
+        ({"task_ids_fpath": "synthetic.txt"}, "with --limit"),
+        ({"limit": 0}, "positive --limit"),
+    ],
+)
+async def test_unsafe_run_settings_fail_before_model_setup(overrides: dict, error: str) -> None:
+    defaults = {
+        "upload_rollouts": False,
+        "num_repeats": 1,
+        "fan_out": False,
+        "responses_create_params": {},
+        "task_ids": None,
+        "task_ids_fpath": None,
+        "limit": None,
+    }
+    with pytest.raises(ValueError, match=error):
+        await rollout_driver.run_rollout_collection(SimpleNamespace(**(defaults | overrides)), {})
 
 
 @pytest.mark.asyncio

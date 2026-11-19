@@ -1,5 +1,6 @@
 split: benchmark
 rollout_collection_driver: benchmarks.non_agentic_if.rollout_driver:run_rollout_collection
+upload_rollouts: false
 non_agentic_if_agent:
   responses_api_agents:
     simple_agent:
